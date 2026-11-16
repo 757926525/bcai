@@ -1,0 +1,14 @@
+services:
+  aimx:
+    build: .
+    container_name: aimx-workbench
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - aimx_data:/app/.data
+
+volumes:
+  aimx_data:

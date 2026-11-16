@@ -1,0 +1,8 @@
+{
+  "name": "AIMX AI 工作台",
+  "description": "集 AI 对话、编程、绘图、多免费大模型接入、Cloudflare D1 存储与 GitHub 仓库分支协同于一体的开源工作台。",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

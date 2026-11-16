@@ -1,0 +1,23 @@
+name = "aimx-ai-workbench"
+compatibility_date = "2025-05-01"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = "dist"
+
+# Cloudflare Workers AI 原生免费绑定（无需 API Token 即可在 Pages/Workers 内部免费调用）
+[ai]
+binding = "AI"
+
+# Cloudflare D1 数据库绑定（用于持久化图片、文件与对话历史）
+# 创建命令: wrangler d1 create aimx-db
+# 建表命令: wrangler d1 execute aimx-db --remote --file=./schema.sql
+[[d1_databases]]
+binding = "DB"
+database_name = "aimx-db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+[vars]
+# 可在 Cloudflare Dashboard -> Settings -> Environment Variables 中配置敏感变量
+# GEMINI_API_KEY, ACCESS_PASSWORD, DEEPSEEK_API_KEY, GROQ_API_KEY, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
