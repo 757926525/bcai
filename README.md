@@ -1,4 +1,4 @@
-# AIMX AI 工作台（编程 · 绘图 · 多免费模型 · D1 存储 · GitHub 分支协同）
+# BCAI 工作台（编程 · 绘图 · 多免费模型 · D1 存储 · GitHub 分支协同）
 
 项目仓库地址：`https://github.com/757926525/aimx`
 
