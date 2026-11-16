@@ -10,7 +10,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
 COPY package*.json ./
-RUN npm ci
+RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.ts ./server.ts
 COPY --from=builder /app/functions ./functions
@@ -19,4 +19,4 @@ COPY --from=builder /app/wrangler.toml ./wrangler.toml
 COPY --from=builder /app/_routes.json ./_routes.json
 COPY --from=builder /app/README.md ./README.md
 EXPOSE 3000
-CMD ["npx", "tsx", "server.ts"]
+CMD ["node", "server.ts"]

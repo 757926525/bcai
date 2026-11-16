@@ -7,17 +7,16 @@ pages_build_output_dir = "dist"
 [ai]
 binding = "AI"
 
-# Cloudflare D1 数据库绑定（用于持久化图片、文件与对话历史）
-# 创建命令: wrangler d1 create aimx-db
-# 建表命令: wrangler d1 execute aimx-db --remote --file=./schema.sql
-[[d1_databases]]
-binding = "DB"
-database_name = "aimx-db"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+# Cloudflare D1 数据库绑定（可选）
+# 注意：切勿保留无效的占位 database_id，否则 Pages 部署会校验失败。
+# 方式一（推荐）：部署后直接在 Cloudflare Dashboard -> Pages -> Settings -> Functions 中绑定 D1 数据库，变量名填 DB。
+# 方式二（Wrangler CLI）：运行 `npx wrangler d1 create aimx-db` 获取真实 UUID 后取消下方注释并填入：
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "aimx-db"
+# database_id = "填入你的真实-D1-UUID"
 
 [vars]
-# 可在 Cloudflare Dashboard -> Settings -> Environment Variables 中配置敏感变量
-# GEMINI_API_KEY, ACCESS_PASSWORD, DEEPSEEK_API_KEY, GROQ_API_KEY, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 OPENAI_BASE_URL = "https://api.openai.com/v1"

@@ -1,4 +1,4 @@
-import express, { Request, Response, NextFunction } from 'express';
+import express, { type Request, type Response, type NextFunction } from 'express';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
@@ -1380,18 +1380,36 @@ async function createServer() {
       };
 
       const distDir = path.join(__dirname, 'dist');
-      if (fs.existsSync(distDir)) {
-        addDirToZip(distDir, null);
-      } else {
-        // Provide index.html + README notice if dist hasn't been built yet
-        zip.file('index.html', fs.readFileSync(path.join(__dirname, 'index.html')));
+      if (!fs.existsSync(path.join(distDir, 'index.html'))) {
+        const { build } = await import('vite');
+        await build({ root: __dirname, logLevel: 'silent' });
+      }
+      addDirToZip(distDir, null);
+
+      // Bundle Cloudflare Pages _worker.js for zero-CLI Dashboard Direct Upload
+      try {
+        const esbuild = await import('esbuild');
+        const workerEntry = path.join(__dirname, 'functions', '_worker-entry.ts');
+        if (fs.existsSync(workerEntry)) {
+          const built = await esbuild.build({
+            entryPoints: [workerEntry],
+            bundle: true,
+            write: false,
+            format: 'esm',
+            target: 'es2022',
+            platform: 'browser',
+          });
+          if (built.outputFiles?.[0]) {
+            zip.file('_worker.js', built.outputFiles[0].contents);
+          }
+        }
+      } catch {
+        // Fallback: include functions/ directory if esbuild is not present in minimal production image
+        const fnFolder = zip.folder('functions');
+        addDirToZip(path.join(__dirname, 'functions'), fnFolder);
       }
 
-      // Include Cloudflare Pages Functions & config files inside the upload package
-      const fnFolder = zip.folder('functions');
-      addDirToZip(path.join(__dirname, 'functions'), fnFolder);
-
-      for (const cfgFile of ['_routes.json', 'wrangler.toml', 'schema.sql', 'README.md', 'package.json', '.env.example']) {
+      for (const cfgFile of ['_routes.json', 'wrangler.toml', 'schema.sql', 'README.md']) {
         const p = path.join(__dirname, cfgFile);
         if (fs.existsSync(p)) {
           zip.file(cfgFile, fs.readFileSync(p));
@@ -1403,13 +1421,15 @@ async function createServer() {
         [
           'AIMX Cloudflare Pages 上传部署包说明',
           '====================================',
-          '1. 若通过 Wrangler CLI 直接上传:',
-          '   npx wrangler pages deploy . --project-name=aimx',
-          '2. 若通过 Cloudflare Dashboard 网页上传静态资源:',
-          '   将根目录下的静态文件 (index.html, assets/) 上传到 Pages；',
-          '   如需完整 functions/ 后端绑定 (Workers AI 与 D1)，推荐使用 Wrangler CLI 部署本目录或连接 Git 仓库 https://github.com/757926525/aimx。',
-          '3. D1 数据库建表命令:',
-          '   npx wrangler d1 execute aimx-db --remote --file=./schema.sql',
+          '1. 网页直接上传（Dashboard Upload Assets）:',
+          '   本压缩包根目录已内置完整编译后的静态前端与 _worker.js 全栈边缘服务端。',
+          '   直接将本 .zip 文件上传到 Cloudflare Dashboard -> Workers & Pages -> Create -> Pages -> Upload assets 即可运行！',
+          '2. Wrangler CLI 上传:',
+          '   解压后在目录内执行: npx wrangler pages deploy . --project-name=aimx',
+          '3. 绑定 Workers AI 与 D1 数据库:',
+          '   进入 Pages 项目 Settings -> Functions:',
+          '   - Workers AI Binding 变量名设为: AI',
+          '   - D1 Database Binding 变量名设为: DB (首次建表执行 npx wrangler d1 execute aimx-db --remote --file=./schema.sql)',
         ].join('\n')
       );
 

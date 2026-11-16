@@ -3,8 +3,9 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/$1" },
-    { "source": "/auth/(.*)", "destination": "/api/github-auth?route=$1" },
+    { "source": "/api/(.*)", "destination": "/api/index" },
+    { "source": "/auth/callback", "destination": "/api/index" },
+    { "source": "/auth/callback/", "destination": "/api/index" },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
 }

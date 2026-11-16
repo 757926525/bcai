@@ -1,4 +1,7 @@
 export interface CFEnv {
+  ASSETS?: {
+    fetch: (request: Request) => Promise<Response>;
+  };
   AI?: {
     run: (model: string, input: Record<string, unknown>, options?: Record<string, unknown>) => Promise<unknown>;
   };
@@ -17,6 +20,7 @@ export interface CFEnv {
   GEMINI_API_KEY?: string;
   CF_ACCOUNT_ID?: string;
   CF_API_TOKEN?: string;
+  CF_D1_DATABASE_ID?: string;
   DEEPSEEK_API_KEY?: string;
   DEEPSEEK_BASE_URL?: string;
   GROQ_API_KEY?: string;
@@ -24,8 +28,10 @@ export interface CFEnv {
   OPENROUTER_API_KEY?: string;
   OPENAI_API_KEY?: string;
   OPENAI_BASE_URL?: string;
+  OPENAI_MODELS?: string;
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
+  GITHUB_TOKEN?: string;
   APP_URL?: string;
 }
 
@@ -44,11 +50,21 @@ export function checkAccess(request: Request, env: CFEnv): Response | null {
   } catch {
     decoded = raw;
   }
-  if (decoded !== expected) {
-    return new Response(JSON.stringify({ error: '访问密码无效或未登录，请先在登录面板验证。' }), {
-      status: 401,
-      headers: { 'content-type': 'application/json' },
-    });
-  }
-  return null;
+  const cookieHeader = request.headers.get('cookie') || '';
+  const hasCookie = cookieHeader.split(';').some((part) => {
+    const idx = part.indexOf('=');
+    if (idx === -1) return false;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    try {
+      return k === 'aimx_access' && decodeURIComponent(v) === expected;
+    } catch {
+      return k === 'aimx_access' && v === expected;
+    }
+  });
+  if (decoded === expected || hasCookie) return null;
+  return new Response(JSON.stringify({ error: '访问密码无效或未登录，请先在计划登录面板验证。' }), {
+    status: 401,
+    headers: { 'content-type': 'application/json' },
+  });
 }
