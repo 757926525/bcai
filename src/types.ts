@@ -1,4 +1,14 @@
-export type WorkspaceMode = 'chat' | 'code' | 'image' | 'repo';
+export type WorkspaceMode = 'code' | 'image' | 'chat' | 'repo' | 'connectors';
+
+export type ThemeId =
+  | 'cf-native'
+  | 'slate-cobalt'
+  | 'emerald-studio'
+  | 'warm-paper'
+  | 'midnight-obsidian'
+  | 'indigo-dusk';
+
+export type LayoutMode = 'auto' | 'mobile' | 'desktop';
 
 export type ProviderType =
   | 'workers-ai'
@@ -44,6 +54,7 @@ export interface ModelOption {
   quotaSummary: string;
   contextWindow: string;
   streamMode: 'direct' | 'proxy';
+  supportsVision?: boolean;
   note?: string;
 }
 
@@ -53,7 +64,18 @@ export interface ImageModelOption {
   defaultSteps: number;
   maxSteps: number;
   supportsCustomSize: boolean;
+  supportsNegativePrompt: boolean;
   quotaSummary: string;
+}
+
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  kind: 'image' | 'file';
+  dataUrl?: string;
+  textContent?: string;
 }
 
 export interface ChatMessage {
@@ -61,6 +83,7 @@ export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   modelId?: string;
+  attachments?: ChatAttachment[];
   createdAt: string;
   paused?: boolean;
 }
@@ -84,15 +107,21 @@ export interface Conversation {
 export interface GeneratedImageCard {
   id: string;
   prompt: string;
+  negativePrompt?: string;
   finalPrompt: string;
   modelId: string;
+  guidance?: number;
+  seed?: string;
   url: string;
   dataUrl?: string;
   createdAt: string;
   savedToDb?: boolean;
+  savedToBucket?: boolean;
   error?: string;
   loading?: boolean;
 }
+
+export type StorageLocationType = 'd1' | 'bucket' | 'local';
 
 export interface SavedAsset {
   id: string;
@@ -104,13 +133,52 @@ export interface SavedAsset {
   model_id?: string;
   content_data: string;
   repo_path?: string;
+  storage_location?: StorageLocationType;
+  bucket_key?: string;
   created_at: string;
   updated_at: string;
 }
 
+export interface StorageBucketConfig {
+  endpoint: string;
+  region: string;
+  bucket: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  publicBaseUrl?: string;
+}
+
+export interface BucketStatusInfo {
+  configured: boolean;
+  connected: boolean;
+  mode: 'cf-r2-binding' | 's3-http' | 'unconfigured' | 'error';
+  label: string;
+  bucketName?: string;
+  itemCount?: number;
+  error?: string;
+}
+
+export interface DbStatusInfo {
+  mode: string;
+  connected: boolean;
+  d1Bound: boolean;
+  label: string;
+  itemCount?: number;
+  error?: string;
+}
+
+export interface SyncStatusInfo {
+  status: 'idle' | 'syncing' | 'success' | 'error';
+  message: string;
+  lastSyncedAt?: string;
+  syncedTarget?: string;
+}
+
 export interface PublicConfig {
-  requiresPassword: boolean;
-  unlocked: boolean;
+  isAdmin: boolean;
+  hasAdminPassword: boolean;
+  usingEnvPassword: boolean;
+  defaultTargetRepoUrl: string;
   appUrl: string;
   envProviders: {
     workersAi: boolean;
@@ -123,18 +191,22 @@ export interface PublicConfig {
     openaiModels: string[];
   };
   d1Bound: boolean;
+  bucketBound: boolean;
   githubOAuthConfigured: boolean;
 }
 
-export interface GitHubUser {
+export type GitProviderType = 'github' | 'gitlab' | 'gitee';
+
+export interface GitUser {
   login: string;
   avatar_url?: string;
   name?: string;
   html_url?: string;
+  provider?: GitProviderType;
 }
 
-export interface GitHubRepo {
-  id: number;
+export interface GitRepo {
+  id: number | string;
   full_name: string;
   name: string;
   default_branch: string;
@@ -143,11 +215,29 @@ export interface GitHubRepo {
   html_url: string;
 }
 
-export interface GitHubTreeItem {
+export interface GitTreeItem {
   path: string;
   type: 'blob' | 'tree';
   size?: number;
   sha: string;
+}
+
+export type ConnectorCategory = 'cloud-disk' | 'email' | 'deploy' | 'other';
+
+export interface ConnectorItem {
+  id: string;
+  category: ConnectorCategory;
+  presetKey: string;
+  name: string;
+  endpoint: string;
+  usernameOrId?: string;
+  secretToken?: string;
+  extraConfig?: string;
+  status: ConnectionState;
+  statusMessage?: string;
+  latencyMs?: number;
+  checkedAt?: string;
+  updatedAt: string;
 }
 
 export interface ProviderGuide {

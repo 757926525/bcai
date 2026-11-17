@@ -1,3 +1,22 @@
+export interface R2ObjectBody {
+  arrayBuffer: () => Promise<ArrayBuffer>;
+  text: () => Promise<string>;
+  httpMetadata?: { contentType?: string };
+}
+
+export interface R2Bucket {
+  put: (
+    key: string,
+    value: ArrayBuffer | Uint8Array | string,
+    options?: { httpMetadata?: { contentType?: string }; customMetadata?: Record<string, string> }
+  ) => Promise<unknown>;
+  get: (key: string) => Promise<R2ObjectBody | null>;
+  delete: (key: string) => Promise<void>;
+  list: (options?: { prefix?: string; limit?: number }) => Promise<{
+    objects: Array<{ key: string; size: number; uploaded: Date }>;
+  }>;
+}
+
 export interface CFEnv {
   ASSETS?: {
     fetch: (request: Request) => Promise<Response>;
@@ -16,11 +35,17 @@ export interface CFEnv {
       run: () => Promise<{ success: boolean; meta?: unknown }>;
     };
   };
+  BUCKET?: R2Bucket;
   ACCESS_PASSWORD?: string;
   GEMINI_API_KEY?: string;
   CF_ACCOUNT_ID?: string;
   CF_API_TOKEN?: string;
   CF_D1_DATABASE_ID?: string;
+  S3_ENDPOINT?: string;
+  S3_REGION?: string;
+  S3_BUCKET?: string;
+  S3_ACCESS_KEY_ID?: string;
+  S3_SECRET_ACCESS_KEY?: string;
   DEEPSEEK_API_KEY?: string;
   DEEPSEEK_BASE_URL?: string;
   GROQ_API_KEY?: string;
@@ -32,6 +57,9 @@ export interface CFEnv {
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
   GITHUB_TOKEN?: string;
+  GITLAB_TOKEN?: string;
+  GITEE_TOKEN?: string;
+  TARGET_REPO_URL?: string;
   APP_URL?: string;
 }
 
@@ -40,31 +68,8 @@ export interface PagesContext {
   env: CFEnv;
 }
 
-export function checkAccess(request: Request, env: CFEnv): Response | null {
-  const expected = env.ACCESS_PASSWORD;
-  if (!expected) return null;
-  const raw = request.headers.get('x-access-password') || '';
-  let decoded = raw;
-  try {
-    decoded = decodeURIComponent(raw);
-  } catch {
-    decoded = raw;
-  }
-  const cookieHeader = request.headers.get('cookie') || '';
-  const hasCookie = cookieHeader.split(';').some((part) => {
-    const idx = part.indexOf('=');
-    if (idx === -1) return false;
-    const k = part.slice(0, idx).trim();
-    const v = part.slice(idx + 1).trim();
-    try {
-      return k === 'aimx_access' && decodeURIComponent(v) === expected;
-    } catch {
-      return k === 'aimx_access' && v === expected;
-    }
-  });
-  if (decoded === expected || hasCookie) return null;
-  return new Response(JSON.stringify({ error: '访问密码无效或未登录，请先在计划登录面板验证。' }), {
-    status: 401,
-    headers: { 'content-type': 'application/json' },
-  });
+export function checkAccess(_request: Request, _env: CFEnv): Response | null {
+  // 默认无登录阻挡：公开用户可直接进入对话、编程与绘图工作区；
+  // 管理员区（数据库、外接API、仓库、连接器）由管理员会话接口单独校验。
+  return null;
 }

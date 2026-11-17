@@ -14,56 +14,72 @@ import {
   Save,
   UploadCloud,
 } from 'lucide-react';
-import { GitHubRepo, GitHubTreeItem, GitHubUser } from '../types';
+import { GitProviderType, GitRepo, GitTreeItem, GitUser } from '../types';
 
 interface GitHubWorkspaceProps {
-  githubUser: GitHubUser | null;
-  githubToken: string;
+  gitProvider: GitProviderType;
+  gitHostUrl: string;
+  gitUser: GitUser | null;
+  gitToken: string;
   oauthConfigured: boolean;
   appUrl: string;
+  targetRepoUrl: string;
   selectedRepo: string;
   selectedBranch: string;
+  onChangeProvider: (provider: GitProviderType, hostUrl: string) => void;
+  onSaveTargetRepoUrl: (url: string) => void;
   onChangeRepoBranch: (repo: string, branch: string) => void;
   onOAuthConnect: () => void;
-  onPatConnect: (token: string) => Promise<void>;
-  onDisconnect: () => Promise<void>;
+  onTokenConnect: (provider: GitProviderType, token: string, hostUrl: string) => Promise<void>;
+  onDisconnect: (provider: GitProviderType) => Promise<void>;
   onStartRepoChat: (repo: string, branch: string, filePath?: string, fileContent?: string) => void;
   pendingCodeToPush?: { code: string; lang: string } | null;
   onClearPendingCode: () => void;
 }
 
 export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
-  githubUser,
-  githubToken,
+  gitProvider,
+  gitHostUrl,
+  gitUser,
+  gitToken,
   oauthConfigured,
   appUrl,
+  targetRepoUrl,
   selectedRepo,
   selectedBranch,
+  onChangeProvider,
+  onSaveTargetRepoUrl,
   onChangeRepoBranch,
   onOAuthConnect,
-  onPatConnect,
+  onTokenConnect,
   onDisconnect,
   onStartRepoChat,
   pendingCodeToPush,
   onClearPendingCode,
 }) => {
   const [patInput, setPatInput] = useState('');
+  const [hostInput, setHostInput] = useState(gitHostUrl || 'https://gitlab.com');
+  const [targetUrlInput, setTargetUrlInput] = useState(targetRepoUrl || 'https://github.com/757926525/bcai');
   const [connecting, setConnecting] = useState(false);
-  const [repos, setRepos] = useState<GitHubRepo[]>([]);
+  const [repos, setRepos] = useState<GitRepo[]>([]);
   const [branches, setBranches] = useState<string[]>(['main']);
-  const [customRepoInput, setCustomRepoInput] = useState(selectedRepo || '757926525/aimx');
-  const [tree, setTree] = useState<GitHubTreeItem[]>([]);
+  const [customRepoInput, setCustomRepoInput] = useState(selectedRepo || '757926525/bcai');
+  const [tree, setTree] = useState<GitTreeItem[]>([]);
   const [loadingTree, setLoadingTree] = useState(false);
 
   const [activeFilePath, setActiveFilePath] = useState('');
   const [fileContent, setFileContent] = useState('');
   const [fileSha, setFileSha] = useState('');
-  const [commitMessage, setCommitMessage] = useState('Update via AIMX AI 工作台');
+  const [commitMessage, setCommitMessage] = useState('Update via BCAI AI 工作台');
   const [newBranchName, setNewBranchName] = useState('');
   const [statusMsg, setStatusMsg] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
   const [pushing, setPushing] = useState(false);
   const [syncingProject, setSyncingProject] = useState(false);
+
+  useEffect(() => {
+    setTargetUrlInput(targetRepoUrl);
+  }, [targetRepoUrl]);
 
   useEffect(() => {
     if (pendingCodeToPush) {
@@ -77,17 +93,23 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
     }
   }, [pendingCodeToPush, activeFilePath, onClearPendingCode]);
 
-  const ghHeaders = () => {
+  const gitHeaders = () => {
     const h: Record<string, string> = { 'content-type': 'application/json' };
-    if (githubToken) h['x-github-token'] = githubToken;
+    if (gitToken) {
+      h['x-git-token'] = gitToken;
+      if (gitProvider === 'github') h['x-github-token'] = gitToken;
+    }
     return h;
   };
 
   const loadRepos = async () => {
     setErrorMsg('');
     try {
-      const r = await fetch('/api/github/repos', { headers: ghHeaders() });
-      const data = (await r.json()) as { repos?: GitHubRepo[]; error?: string };
+      const r = await fetch(
+        `/api/git/repos?provider=${gitProvider}&hostUrl=${encodeURIComponent(hostInput)}`,
+        { headers: gitHeaders() }
+      );
+      const data = (await r.json()) as { repos?: GitRepo[]; error?: string };
       if (!r.ok) throw new Error(data.error || '加载仓库列表失败');
       setRepos(data.repos || []);
     } catch (e: any) {
@@ -101,23 +123,29 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
     setErrorMsg('');
     try {
       const [brRes, trRes] = await Promise.all([
-        fetch(`/api/github/branches?repo=${encodeURIComponent(repo)}`, { headers: ghHeaders() }),
-        fetch(`/api/github/tree?repo=${encodeURIComponent(repo)}&branch=${encodeURIComponent(branch)}`, {
-          headers: ghHeaders(),
-        }),
+        fetch(
+          `/api/git/branches?provider=${gitProvider}&hostUrl=${encodeURIComponent(hostInput)}&repo=${encodeURIComponent(repo)}`,
+          { headers: gitHeaders() }
+        ),
+        fetch(
+          `/api/git/tree?provider=${gitProvider}&hostUrl=${encodeURIComponent(hostInput)}&repo=${encodeURIComponent(repo)}&branch=${encodeURIComponent(branch)}`,
+          { headers: gitHeaders() }
+        ),
       ]);
       const brData = (await brRes.json()) as { branches?: Array<{ name: string }> };
       if (Array.isArray(brData.branches) && brData.branches.length > 0) {
         setBranches(brData.branches.map((b) => b.name));
       }
-      const trData = (await trRes.json()) as { tree?: GitHubTreeItem[]; error?: string };
+      const trData = (await trRes.json()) as { tree?: GitTreeItem[]; error?: string };
       if (trRes.ok && Array.isArray(trData.tree)) {
         setTree(trData.tree.filter((i) => i.type === 'blob').slice(0, 180));
       } else {
         setTree([]);
         const msg = trData.error || '';
         if (trRes.status === 409 || msg.toLowerCase().includes('empty')) {
-          setStatusMsg(`仓库 ${repo} 当前为空仓库，连接 Token 后点击「推送本项目到仓库」即可自动初始化 ${branch} 分支并上传全部源码。`);
+          setStatusMsg(
+            `仓库 ${repo} 当前为空仓库，保存 Token 后点击「推送本项目到仓库」即可自动初始化 ${branch} 分支并上传全部源码。`
+          );
         } else if (msg) {
           setErrorMsg(`目录读取提示: ${msg}`);
         }
@@ -130,24 +158,21 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
   };
 
   useEffect(() => {
-    if (githubUser) {
-      loadRepos();
-    }
-  }, [githubUser]);
+    if (gitUser) loadRepos();
+    else setRepos([]);
+  }, [gitUser, gitProvider]);
 
   useEffect(() => {
-    if (selectedRepo) {
-      loadBranchesAndTree(selectedRepo, selectedBranch || 'main');
-    }
-  }, [selectedRepo, selectedBranch, githubUser]);
+    if (selectedRepo) loadBranchesAndTree(selectedRepo, selectedBranch || 'main');
+  }, [selectedRepo, selectedBranch, gitUser, gitProvider]);
 
   const handleOpenFile = async (path: string) => {
     setErrorMsg('');
     setStatusMsg('');
     try {
       const r = await fetch(
-        `/api/github/file?repo=${encodeURIComponent(selectedRepo)}&branch=${encodeURIComponent(selectedBranch)}&path=${encodeURIComponent(path)}`,
-        { headers: ghHeaders() }
+        `/api/git/file?provider=${gitProvider}&hostUrl=${encodeURIComponent(hostInput)}&repo=${encodeURIComponent(selectedRepo)}&branch=${encodeURIComponent(selectedBranch)}&path=${encodeURIComponent(path)}`,
+        { headers: gitHeaders() }
       );
       const data = (await r.json()) as { content?: string; sha?: string; error?: string };
       if (!r.ok) throw new Error(data.error || '读取文件失败');
@@ -165,10 +190,16 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
     setErrorMsg('');
     setStatusMsg('');
     try {
-      const r = await fetch('/api/github/branch', {
+      const r = await fetch('/api/git/branch', {
         method: 'POST',
-        headers: ghHeaders(),
-        body: JSON.stringify({ repo: selectedRepo, newBranch: clean, fromBranch: selectedBranch }),
+        headers: gitHeaders(),
+        body: JSON.stringify({
+          provider: gitProvider,
+          hostUrl: hostInput,
+          repo: selectedRepo,
+          newBranch: clean,
+          fromBranch: selectedBranch,
+        }),
       });
       const data = (await r.json()) as { ok?: boolean; error?: string };
       if (!r.ok) throw new Error(data.error || '创建分支失败');
@@ -189,10 +220,12 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
     setErrorMsg('');
     setStatusMsg('');
     try {
-      const r = await fetch('/api/github/file', {
+      const r = await fetch('/api/git/file', {
         method: 'PUT',
-        headers: ghHeaders(),
+        headers: gitHeaders(),
         body: JSON.stringify({
+          provider: gitProvider,
+          hostUrl: hostInput,
           repo: selectedRepo,
           branch: selectedBranch,
           path: activeFilePath.trim(),
@@ -218,39 +251,38 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
     setErrorMsg('');
     setStatusMsg('');
     try {
-      const headers = ghHeaders();
+      const headers = gitHeaders();
       const inlineToken = patInput.trim();
-      if (!githubToken && inlineToken) {
-        headers['x-github-token'] = inlineToken;
+      if (!gitToken && inlineToken) {
+        headers['x-git-token'] = inlineToken;
+        if (gitProvider === 'github') headers['x-github-token'] = inlineToken;
       }
-      const r = await fetch('/api/github/sync-project', {
+      const r = await fetch('/api/git/sync-project', {
         method: 'POST',
         headers,
         body: JSON.stringify({
-          repo: selectedRepo || '757926525/aimx',
+          provider: gitProvider,
+          hostUrl: hostInput,
+          repo: selectedRepo || '757926525/bcai',
           branch: selectedBranch || 'main',
-          commitMessage: 'feat: AIMX AI Workbench full-stack & Cloudflare Pages project',
+          commitMessage: 'feat: BCAI AI Workbench full-stack update',
         }),
       });
       const data = (await r.json()) as {
         pushedCount?: number;
         total?: number;
         commitSha?: string;
-        commitUrl?: string;
         errors?: string[];
         error?: string;
       };
       if (!r.ok) throw new Error(data.error || '同步项目失败');
-      if (!githubUser && inlineToken) {
-        await onPatConnect(inlineToken);
+      if (!gitUser && inlineToken) {
+        await onTokenConnect(gitProvider, inlineToken, hostInput);
         setPatInput('');
       }
       setStatusMsg(
-        `已成功原子提交并推送 ${data.pushedCount}/${data.total} 个文件到 ${selectedRepo}@${selectedBranch}${data.commitSha ? ` (${data.commitSha.slice(0, 7)})` : ''}`
+        `已成功推送 ${data.pushedCount}/${data.total} 个文件到 [${gitProvider.toUpperCase()}] ${selectedRepo}@${selectedBranch}${data.commitSha ? ` (${data.commitSha.slice(0, 7)})` : ''}`
       );
-      if (data.errors?.length) {
-        setErrorMsg(`部分文件提示: ${data.errors.slice(0, 3).join('; ')}`);
-      }
       loadBranchesAndTree(selectedRepo, selectedBranch);
     } catch (e: any) {
       setErrorMsg(e?.message || '项目同步失败');
@@ -265,7 +297,7 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
     setConnecting(true);
     setErrorMsg('');
     try {
-      await onPatConnect(patInput.trim());
+      await onTokenConnect(gitProvider, patInput.trim(), hostInput);
       setPatInput('');
     } catch (err: any) {
       setErrorMsg(err?.message || 'Token 验证失败');
@@ -274,80 +306,146 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
     }
   };
 
+  const handleSaveCustomTarget = () => {
+    const clean = targetUrlInput.trim() || 'https://github.com/757926525/bcai';
+    onSaveTargetRepoUrl(clean);
+    try {
+      const u = new URL(clean);
+      const slug = u.pathname.replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '');
+      if (slug) {
+        setCustomRepoInput(slug);
+        onChangeRepoBranch(slug, selectedBranch);
+      }
+      if (u.hostname.includes('gitlab')) onChangeProvider('gitlab', u.origin);
+      else if (u.hostname.includes('gitee')) onChangeProvider('gitee', 'https://gitee.com');
+      else onChangeProvider('github', 'https://github.com');
+    } catch {
+      setCustomRepoInput(clean);
+      onChangeRepoBranch(clean, selectedBranch);
+    }
+    setStatusMsg(`已保存自定义目标仓库：${clean}`);
+  };
+
   return (
-    <div className="flex-1 overflow-y-auto px-4 py-6">
+    <div className="flex-1 overflow-y-auto px-3 sm:px-5 py-4 sm:py-6">
       <div className="max-w-6xl mx-auto space-y-5">
-        {/* Top Auth & Repo Selection Bar */}
-        <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 space-y-4">
+        {/* Provider Switcher + Custom Saveable Target Repo */}
+        <div className="rounded-xl border wb-border wb-panel p-4 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-lg bg-slate-100 dark:bg-slate-800 flex items-center justify-center">
-                <Github className="w-5 h-5 text-slate-800 dark:text-slate-200" />
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="w-10 h-10 rounded-lg wb-code flex items-center justify-center shrink-0">
+                <Github className="w-5 h-5 wb-ink" />
               </div>
-              <div>
-                <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-                  GitHub 仓库授权与分支读写协同
+              <div className="min-w-0">
+                <h2 className="text-base font-semibold wb-ink">
+                  多平台仓库授权与分支读写协同（GitHub · GitLab · Gitee）
                 </h2>
-                <p className="text-xs text-slate-500 dark:text-slate-400">
-                  {githubUser
-                    ? `已授权登录：${githubUser.login} · 连接状态已保存`
-                    : '未连接 GitHub 账号，可跳转 OAuth 授权或使用 Personal Access Token'}
+                <p className="text-xs wb-muted">
+                  {gitUser
+                    ? `已连接 [${gitProvider.toUpperCase()}]：${gitUser.login} · Token 连接状态已保存`
+                    : `当前未连接 ${gitProvider.toUpperCase()}，支持保存 Token 连接或跳转 OAuth 授权`}
                 </p>
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-1.5 p-1 rounded-lg wb-bg border wb-border">
+              {(['github', 'gitlab', 'gitee'] as GitProviderType[]).map((p) => (
+                <button
+                  key={p}
+                  type="button"
+                  onClick={() => onChangeProvider(p, p === 'gitlab' ? hostInput : p === 'gitee' ? 'https://gitee.com' : 'https://github.com')}
+                  className={`h-8 px-3 rounded-md text-xs font-medium uppercase transition-colors ${
+                    gitProvider === p ? 'wb-panel wb-ink shadow-sm' : 'wb-muted'
+                  }`}
+                >
+                  {p === 'github' ? 'GitHub' : p === 'gitlab' ? 'GitLab / 自建' : 'Gitee 码云'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Customizable & Saveable Target Repo URL */}
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-2.5 pt-2 border-t wb-border items-end">
+            <div className="md:col-span-8 flex flex-col gap-1">
+              <label className="text-xs wb-muted">可管理可自定义保存的目标开源仓库地址（默认 https://github.com/757926525/bcai）</label>
+              <input
+                type="text"
+                value={targetUrlInput}
+                onChange={(e) => setTargetUrlInput(e.target.value)}
+                placeholder="https://github.com/757926525/bcai"
+                className="h-9 px-3 rounded-lg border wb-border wb-bg text-xs font-mono wb-ink"
+              />
+            </div>
+            <div className="md:col-span-4 flex gap-2">
               <button
                 type="button"
-                onClick={onOAuthConnect}
-                className="h-9 px-3.5 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-medium inline-flex items-center gap-1.5 hover:opacity-90"
+                onClick={handleSaveCustomTarget}
+                className="flex-1 h-9 px-3 rounded-lg wb-accent text-xs font-medium whitespace-nowrap"
               >
-                <ExternalLink className="w-3.5 h-3.5" />
-                <span>{githubUser ? '重新 OAuth 授权' : '跳转到 GitHub 授权连接'}</span>
+                保存目标仓库地址
               </button>
-              {githubUser && (
+              {gitProvider === 'github' && (
                 <button
                   type="button"
-                  onClick={onDisconnect}
-                  className="h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-800 text-xs text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1.5"
+                  onClick={onOAuthConnect}
+                  className="h-9 px-3 rounded-lg border wb-border wb-panel text-xs font-medium wb-ink inline-flex items-center gap-1 whitespace-nowrap"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>OAuth 授权</span>
+                </button>
+              )}
+              {gitUser && (
+                <button
+                  type="button"
+                  onClick={() => onDisconnect(gitProvider)}
+                  className="h-9 px-3 rounded-lg border wb-border text-xs text-red-600 dark:text-red-400 inline-flex items-center gap-1 whitespace-nowrap"
                 >
                   <LogOut className="w-3.5 h-3.5" />
-                  <span>断开连接</span>
+                  <span>断开</span>
                 </button>
               )}
             </div>
           </div>
 
-          {!githubUser && (
-            <form onSubmit={handlePatSubmit} className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
-              <KeyRound className="w-4 h-4 text-slate-400 shrink-0" />
+          {/* Token Form */}
+          {!gitUser && (
+            <form onSubmit={handlePatSubmit} className="flex flex-wrap items-center gap-2 pt-2 border-t wb-border">
+              <KeyRound className="w-4 h-4 wb-muted shrink-0" />
+              {gitProvider === 'gitlab' && (
+                <input
+                  type="text"
+                  value={hostInput}
+                  onChange={(e) => setHostInput(e.target.value)}
+                  placeholder="https://gitlab.com 或私有 GitLab 地址"
+                  className="w-56 h-9 px-3 rounded-lg border wb-border wb-bg text-xs font-mono wb-ink"
+                />
+              )}
               <input
                 type="password"
                 value={patInput}
                 onChange={(e) => setPatInput(e.target.value)}
-                placeholder="或输入 GitHub Personal Access Token (ghp_... 需含 repo 权限) 并保存连接状态"
-                className="flex-1 min-w-[240px] h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-xs text-slate-900 dark:text-slate-100"
+                placeholder={`输入 ${gitProvider.toUpperCase()} Access Token 并保存连接状态`}
+                className="flex-1 min-w-[220px] h-9 px-3 rounded-lg border wb-border wb-bg text-xs wb-ink"
               />
               <button
                 type="submit"
                 disabled={connecting || !patInput.trim()}
-                className="h-9 px-4 rounded-lg bg-blue-600 text-white text-xs font-medium hover:bg-blue-700 disabled:opacity-50"
+                className="h-9 px-4 rounded-lg wb-accent text-xs font-medium disabled:opacity-50 whitespace-nowrap"
               >
                 {connecting ? '连接中...' : '保存 Token 连接'}
               </button>
-              {!oauthConfigured && (
-                <span className="text-[11px] text-slate-500 dark:text-slate-400 w-full">
-                  提示：如需启用一键跳转 OAuth，请在 GitHub Developer Settings 注册回调地址{' '}
-                  <code className="font-mono">{appUrl}/auth/callback</code> 并配置 GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET。
+              {gitProvider === 'github' && !oauthConfigured && (
+                <span className="text-[11px] wb-muted w-full">
+                  OAuth 回调地址参考：<code className="font-mono">{appUrl}/auth/callback</code>
                 </span>
               )}
             </form>
           )}
 
           {/* Repo & Branch Picker */}
-          <div className="grid grid-cols-1 md:grid-cols-12 gap-3 pt-3 border-t border-slate-100 dark:border-slate-800 items-end">
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-3 pt-3 border-t wb-border items-end">
             <div className="md:col-span-5 flex flex-col gap-1">
-              <label className="text-xs text-slate-500 dark:text-slate-400">选择或输入仓库（owner/repo）</label>
+              <label className="text-xs wb-muted">选择或输入仓库（owner/repo）</label>
               <div className="flex gap-2">
                 {repos.length > 0 ? (
                   <select
@@ -357,11 +455,11 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
                       onChangeRepoBranch(e.target.value, r?.default_branch || 'main');
                       setCustomRepoInput(e.target.value);
                     }}
-                    className="flex-1 h-9 px-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-xs text-slate-900 dark:text-slate-100"
+                    className="flex-1 min-w-0 h-9 px-2.5 rounded-lg border wb-border wb-bg text-xs wb-ink"
                   >
-                    <option value="757926525/aimx">757926525/aimx（默认项目仓库）</option>
+                    <option value="757926525/bcai">757926525/bcai（默认 BCAI 仓库）</option>
                     {repos
-                      .filter((r) => r.full_name !== '757926525/aimx')
+                      .filter((r) => r.full_name !== '757926525/bcai')
                       .map((r) => (
                         <option key={r.id} value={r.full_name}>
                           {r.full_name} {r.private ? '(私有)' : ''}
@@ -373,14 +471,14 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
                     type="text"
                     value={customRepoInput}
                     onChange={(e) => setCustomRepoInput(e.target.value)}
-                    placeholder="757926525/aimx"
-                    className="flex-1 h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-xs font-mono text-slate-900 dark:text-slate-100"
+                    placeholder="757926525/bcai"
+                    className="flex-1 min-w-0 h-9 px-3 rounded-lg border wb-border wb-bg text-xs font-mono wb-ink"
                   />
                 )}
                 <button
                   type="button"
                   onClick={() => onChangeRepoBranch(customRepoInput.trim() || selectedRepo, selectedBranch)}
-                  className="h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-800 text-xs hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
+                  className="h-9 px-3 rounded-lg border wb-border text-xs wb-ink hover:opacity-80 whitespace-nowrap"
                 >
                   载入
                 </button>
@@ -388,12 +486,12 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
             </div>
 
             <div className="md:col-span-3 flex flex-col gap-1">
-              <label className="text-xs text-slate-500 dark:text-slate-400">当前分支</label>
+              <label className="text-xs wb-muted">当前分支</label>
               <div className="flex gap-1.5">
                 <select
                   value={selectedBranch}
                   onChange={(e) => onChangeRepoBranch(selectedRepo, e.target.value)}
-                  className="flex-1 h-9 px-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-xs font-mono text-slate-900 dark:text-slate-100"
+                  className="flex-1 min-w-0 h-9 px-2.5 rounded-lg border wb-border wb-bg text-xs font-mono wb-ink"
                 >
                   {branches.map((b) => (
                     <option key={b} value={b}>
@@ -404,7 +502,7 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
                 <button
                   type="button"
                   onClick={() => loadBranchesAndTree(selectedRepo, selectedBranch)}
-                  className="h-9 w-9 rounded-lg border border-slate-200 dark:border-slate-800 flex items-center justify-center hover:bg-slate-50 dark:hover:bg-slate-800"
+                  className="h-9 w-9 rounded-lg border wb-border flex items-center justify-center hover:opacity-80 shrink-0"
                   title="刷新目录与分支"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${loadingTree ? 'animate-spin' : ''}`} />
@@ -416,10 +514,10 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
               <button
                 type="button"
                 onClick={() => onStartRepoChat(selectedRepo, selectedBranch, activeFilePath || undefined, fileContent || undefined)}
-                className="h-9 px-3.5 rounded-lg bg-blue-600 text-white text-xs font-medium inline-flex items-center gap-1.5 hover:bg-blue-700 whitespace-nowrap"
+                className="h-9 px-3.5 rounded-lg wb-accent text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap"
               >
                 <MessageSquarePlus className="w-3.5 h-3.5" />
-                <span>进入该仓库分支对话</span>
+                <span>进入仓库分支对话</span>
               </button>
               <button
                 type="button"
@@ -436,11 +534,11 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
           {statusMsg && (
             <div className="px-3 py-2 rounded-lg bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900 text-xs text-emerald-800 dark:text-emerald-300 flex items-center gap-2">
               <Check className="w-4 h-4 shrink-0" />
-              <span>{statusMsg}</span>
+              <span className="break-all">{statusMsg}</span>
             </div>
           )}
           {errorMsg && (
-            <div className="px-3 py-2 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 text-xs text-red-700 dark:text-red-400">
+            <div className="px-3 py-2 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 text-xs text-red-700 dark:text-red-400 break-all">
               {errorMsg}
             </div>
           )}
@@ -448,17 +546,16 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
 
         {/* File Tree & Editor Split */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-          {/* File Tree + New Branch */}
-          <div className="lg:col-span-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex flex-col max-h-[540px]">
-            <div className="px-3.5 py-2.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
-              <span className="text-xs font-semibold text-slate-900 dark:text-slate-100 inline-flex items-center gap-1.5">
-                <FolderGit2 className="w-4 h-4 text-slate-500" />
+          <div className="lg:col-span-4 rounded-xl border wb-border wb-panel flex flex-col max-h-[540px]">
+            <div className="px-3.5 py-2.5 border-b wb-border flex items-center justify-between">
+              <span className="text-xs font-semibold wb-ink inline-flex items-center gap-1.5">
+                <FolderGit2 className="w-4 h-4 wb-muted" />
                 <span>仓库文件树 ({tree.length})</span>
               </span>
             </div>
             <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
               {tree.length === 0 ? (
-                <p className="text-xs text-slate-500 p-3 text-center">
+                <p className="text-xs wb-muted p-3 text-center">
                   {loadingTree ? '正在加载目录树…' : '暂无文件记录或该分支尚未初始化。'}
                 </p>
               ) : (
@@ -468,31 +565,29 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
                     type="button"
                     onClick={() => handleOpenFile(item.path)}
                     className={`w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-mono truncate flex items-center gap-2 ${
-                      activeFilePath === item.path
-                        ? 'bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300 font-medium'
-                        : 'text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
+                      activeFilePath === item.path ? 'wb-tint wb-accent-text font-medium' : 'wb-ink hover:opacity-80'
                     }`}
                   >
-                    <FileCode2 className="w-3.5 h-3.5 shrink-0 text-slate-400" />
+                    <FileCode2 className="w-3.5 h-3.5 shrink-0 wb-muted" />
                     <span className="truncate">{item.path}</span>
                   </button>
                 ))
               )}
             </div>
-            {githubUser && (
-              <div className="p-2.5 border-t border-slate-200 dark:border-slate-800 flex gap-1.5">
+            {gitUser && (
+              <div className="p-2.5 border-t wb-border flex gap-1.5">
                 <input
                   type="text"
                   value={newBranchName}
                   onChange={(e) => setNewBranchName(e.target.value)}
-                  placeholder="新分支名称 (如 feat/ai)"
-                  className="flex-1 h-8 px-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-xs font-mono"
+                  placeholder="新分支名 (如 feat/ui)"
+                  className="flex-1 min-w-0 h-8 px-2.5 rounded-lg border wb-border wb-bg text-xs font-mono wb-ink"
                 />
                 <button
                   type="button"
                   onClick={handleCreateBranch}
                   disabled={!newBranchName.trim()}
-                  className="h-8 px-2.5 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-medium hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1 disabled:opacity-40 whitespace-nowrap"
+                  className="h-8 px-2.5 rounded-lg border wb-border text-xs font-medium wb-ink inline-flex items-center gap-1 disabled:opacity-40 whitespace-nowrap"
                 >
                   <Plus className="w-3.5 h-3.5" />
                   <span>新建分支</span>
@@ -501,23 +596,22 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
             )}
           </div>
 
-          {/* Code Read/Write & Commit Push */}
-          <div className="lg:col-span-8 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex flex-col min-h-[540px]">
-            <div className="p-3 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center gap-2">
-              <GitBranch className="w-4 h-4 text-blue-600 shrink-0" />
-              <span className="text-xs font-mono text-slate-500">{selectedBranch} /</span>
+          <div className="lg:col-span-8 rounded-xl border wb-border wb-panel flex flex-col min-h-[500px]">
+            <div className="p-3 border-b wb-border flex flex-wrap items-center gap-2">
+              <GitBranch className="w-4 h-4 wb-accent-text shrink-0" />
+              <span className="text-xs font-mono wb-muted">{selectedBranch} /</span>
               <input
                 type="text"
                 value={activeFilePath}
                 onChange={(e) => setActiveFilePath(e.target.value)}
                 placeholder="输入或点击左侧文件路径 (例如 README.md)"
-                className="flex-1 min-w-[180px] h-8 px-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-xs font-mono text-slate-900 dark:text-slate-100"
+                className="flex-1 min-w-[160px] h-8 px-2.5 rounded-lg border wb-border wb-bg text-xs font-mono wb-ink"
               />
               <button
                 type="button"
                 onClick={() => onStartRepoChat(selectedRepo, selectedBranch, activeFilePath, fileContent)}
                 disabled={!activeFilePath}
-                className="h-8 px-3 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-medium hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap"
+                className="h-8 px-3 rounded-lg border wb-border text-xs font-medium wb-ink disabled:opacity-40 whitespace-nowrap"
               >
                 带着此文件提问 AI
               </button>
@@ -527,22 +621,22 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
               value={fileContent}
               onChange={(e) => setFileContent(e.target.value)}
               placeholder="点击左侧仓库文件读取内容，或直接在此编写代码/文档后提交推送到所选分支…"
-              className="flex-1 w-full p-4 bg-slate-50 dark:bg-slate-950 font-mono text-xs leading-relaxed text-slate-800 dark:text-slate-200 resize-none focus:outline-none"
+              className="flex-1 w-full p-4 wb-bg font-mono text-xs leading-relaxed wb-ink resize-none focus:outline-none"
             />
 
-            <div className="p-3 border-t border-slate-200 dark:border-slate-800 flex flex-wrap items-center gap-2">
+            <div className="p-3 border-t wb-border flex flex-wrap items-center gap-2">
               <input
                 type="text"
                 value={commitMessage}
                 onChange={(e) => setCommitMessage(e.target.value)}
                 placeholder="Commit 提交说明"
-                className="flex-1 min-w-[200px] h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-xs"
+                className="flex-1 min-w-[180px] h-9 px-3 rounded-lg border wb-border wb-bg text-xs wb-ink"
               />
               <button
                 type="button"
                 onClick={handlePushFile}
-                disabled={pushing || !githubUser || !activeFilePath.trim()}
-                className="h-9 px-4 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium inline-flex items-center gap-1.5 disabled:opacity-40 whitespace-nowrap"
+                disabled={pushing || !gitUser || !activeFilePath.trim()}
+                className="h-9 px-4 rounded-lg wb-accent text-xs font-medium inline-flex items-center gap-1.5 disabled:opacity-40 whitespace-nowrap"
               >
                 <Save className="w-3.5 h-3.5" />
                 <span>{pushing ? '提交推送中...' : '提交并推送到分支'}</span>

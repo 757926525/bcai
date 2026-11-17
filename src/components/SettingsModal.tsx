@@ -1,19 +1,45 @@
 import React, { useEffect, useState } from 'react';
-import { BookOpen, ExternalLink, Plus, RefreshCw, Trash2, X } from 'lucide-react';
-import { PROVIDER_GUIDES } from '../data/models';
-import { ExternalProvider, ProviderStatusInfo, ProviderType, PublicConfig } from '../types';
+import {
+  BookOpen,
+  ExternalLink,
+  Laptop,
+  Moon,
+  Palette,
+  Plus,
+  RefreshCw,
+  Smartphone,
+  Sun,
+  Trash2,
+  X,
+} from 'lucide-react';
+import { PROVIDER_GUIDES, WORKBENCH_THEMES } from '../data/models';
+import {
+  ExternalProvider,
+  LayoutMode,
+  ProviderStatusInfo,
+  ProviderType,
+  PublicConfig,
+  ThemeId,
+} from '../types';
 import { uid } from '../utils/format';
 import { StatusIndicator } from './StatusIndicator';
 
 interface SettingsModalProps {
   open: boolean;
-  initialTab?: 'providers' | 'guides';
+  initialTab?: 'providers' | 'guides' | 'appearance';
   onClose: () => void;
+  isAdmin: boolean;
   providers: ExternalProvider[];
   providerStatuses: Record<string, ProviderStatusInfo>;
   publicConfig: PublicConfig | null;
   temperature: number;
   onChangeTemperature: (t: number) => void;
+  themeId: ThemeId;
+  onChangeTheme: (id: ThemeId) => void;
+  dark: boolean;
+  onToggleDark: () => void;
+  layoutMode: LayoutMode;
+  onChangeLayoutMode: (m: LayoutMode) => void;
   onSaveProvider: (provider: ExternalProvider) => void;
   onDeleteProvider: (id: string) => void;
   onProbeProvider: (provider: ExternalProvider) => Promise<void>;
@@ -32,23 +58,35 @@ const DEFAULT_BASE_BY_TYPE: Record<ProviderType, string> = {
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   open,
-  initialTab = 'providers',
+  initialTab = 'appearance',
   onClose,
+  isAdmin,
   providers,
   providerStatuses,
   publicConfig,
   temperature,
   onChangeTemperature,
+  themeId,
+  onChangeTheme,
+  dark,
+  onToggleDark,
+  layoutMode,
+  onChangeLayoutMode,
   onSaveProvider,
   onDeleteProvider,
   onProbeProvider,
   onProbeAll,
   onClearAllConversations,
 }) => {
-  const [tab, setTab] = useState<'providers' | 'guides'>(initialTab);
+  const [tab, setTab] = useState<'providers' | 'guides' | 'appearance'>(initialTab);
+
   useEffect(() => {
-    if (open) setTab(initialTab);
-  }, [open, initialTab]);
+    if (open) {
+      if (initialTab === 'providers' && !isAdmin) setTab('guides');
+      else setTab(initialTab);
+    }
+  }, [open, initialTab, isAdmin]);
+
   const [editingId, setEditingId] = useState<string | null>(null);
   const [name, setName] = useState('');
   const [providerType, setProviderType] = useState<ProviderType>('openai-compatible');
@@ -127,61 +165,148 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4">
-      <div className="w-full max-w-4xl max-h-[90vh] flex flex-col rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xl overflow-hidden">
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200 dark:border-slate-800">
-          <div className="flex items-center gap-4">
-            <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
-              设置与模型接入中心
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-2 sm:p-4">
+      <div className="w-full max-w-4xl max-h-[92vh] flex flex-col rounded-xl border wb-border wb-panel shadow-xl overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between px-4 sm:px-6 py-3.5 border-b wb-border gap-3">
+          <div className="flex flex-wrap items-center gap-3 min-w-0">
+            <h2 className="text-base sm:text-lg font-semibold wb-ink whitespace-nowrap">
+              {isAdmin ? '设置、主题与模型接入中心' : '主题外观与免费模型指南'}
             </h2>
-            <div className="flex items-center gap-1 p-1 rounded-lg bg-slate-100 dark:bg-slate-800">
+            <div className="flex items-center gap-1 p-1 rounded-lg wb-bg border wb-border overflow-x-auto no-scrollbar max-w-full">
+              {isAdmin && (
+                <button
+                  type="button"
+                  onClick={() => setTab('providers')}
+                  className={`px-3 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+                    tab === 'providers' ? 'wb-panel wb-ink shadow-sm' : 'wb-muted'
+                  }`}
+                >
+                  外接 API 与模型管理
+                </button>
+              )}
               <button
                 type="button"
-                onClick={() => setTab('providers')}
-                className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${
-                  tab === 'providers'
-                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-sm'
-                    : 'text-slate-600 dark:text-slate-400'
+                onClick={() => setTab('appearance')}
+                className={`px-3 py-1 rounded-md text-xs font-medium transition-colors inline-flex items-center gap-1 whitespace-nowrap ${
+                  tab === 'appearance' ? 'wb-panel wb-ink shadow-sm' : 'wb-muted'
                 }`}
               >
-                外接 API 与模型管理
+                <Palette className="w-3.5 h-3.5" />
+                <span>主题与布局 (6款)</span>
               </button>
               <button
                 type="button"
                 onClick={() => setTab('guides')}
-                className={`px-3 py-1 rounded-md text-xs font-medium transition-colors inline-flex items-center gap-1 ${
-                  tab === 'guides'
-                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-sm'
-                    : 'text-slate-600 dark:text-slate-400'
+                className={`px-3 py-1 rounded-md text-xs font-medium transition-colors inline-flex items-center gap-1 whitespace-nowrap ${
+                  tab === 'guides' ? 'wb-panel wb-ink shadow-sm' : 'wb-muted'
                 }`}
               >
                 <BookOpen className="w-3.5 h-3.5" />
-                <span>免费额度与详细接入指南</span>
+                <span>免费模型与接入指南</span>
               </button>
             </div>
           </div>
           <button
             type="button"
             onClick={onClose}
-            className="w-9 h-9 rounded-lg flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+            className="w-9 h-9 rounded-lg flex items-center justify-center wb-muted hover:bg-black/5 dark:hover:bg-white/5 shrink-0"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-6 space-y-6">
-          {tab === 'providers' ? (
+        <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6">
+          {tab === 'appearance' ? (
+            <div className="space-y-5">
+              {/* Theme Grid */}
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-semibold wb-ink">工作台配色主题（含 CF 原生同款）</h3>
+                    <p className="text-xs wb-muted">所有主题均支持浅色 / 深色双模式即时切换</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onToggleDark}
+                    className="h-9 px-3.5 rounded-lg border wb-border wb-bg text-xs font-medium wb-ink inline-flex items-center gap-1.5"
+                  >
+                    {dark ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
+                    <span>{dark ? '当前深色 · 切浅色' : '当前浅色 · 切深色'}</span>
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {WORKBENCH_THEMES.map((t) => {
+                    const active = themeId === t.id;
+                    return (
+                      <button
+                        key={t.id}
+                        type="button"
+                        onClick={() => onChangeTheme(t.id)}
+                        className={`text-left p-3.5 rounded-xl border transition-colors space-y-2 ${
+                          active ? 'border-blue-600 wb-tint' : 'wb-border wb-bg hover:opacity-90'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-semibold wb-ink">{t.name}</span>
+                          <div className="flex items-center gap-1 shrink-0">
+                            {t.previewSwatches.map((hex, i) => (
+                              <span
+                                key={i}
+                                className="w-3.5 h-3.5 rounded-full border border-black/15"
+                                style={{ backgroundColor: hex }}
+                              />
+                            ))}
+                          </div>
+                        </div>
+                        <p className="text-xs wb-muted leading-snug">{t.description}</p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Layout Switcher */}
+              <div className="rounded-xl border wb-border wb-bg p-4 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold wb-ink">界面布局模式（手机 / 电脑一键切换）</div>
+                  <p className="text-xs wb-muted">手机布局强化单手触控、全屏窄框零文字遮挡；电脑布局默认展开侧边栏与双栏预览。</p>
+                </div>
+                <div className="flex items-center gap-1 p-1 rounded-lg wb-panel border wb-border">
+                  {(
+                    [
+                      ['auto', '自适应', Laptop],
+                      ['mobile', '手机布局', Smartphone],
+                      ['desktop', '电脑布局', Laptop],
+                    ] as Array<[LayoutMode, string, React.ComponentType<{ className?: string }>]>
+                  ).map(([k, label, Icon]) => (
+                    <button
+                      key={k}
+                      type="button"
+                      onClick={() => onChangeLayoutMode(k)}
+                      className={`h-8 px-3 rounded-md text-xs font-medium inline-flex items-center gap-1.5 ${
+                        layoutMode === k ? 'wb-accent' : 'wb-muted'
+                      }`}
+                    >
+                      <Icon className="w-3.5 h-3.5" />
+                      <span>{label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          ) : tab === 'providers' && isAdmin ? (
             <>
               {/* Header controls */}
               <div className="flex flex-wrap items-center justify-between gap-3">
-                <p className="text-xs text-slate-500 dark:text-slate-400">
+                <p className="text-xs wb-muted">
                   支持后端环境变量注入（<code className="font-mono">.env</code> / Cloudflare Secrets）与前端本地保存两种方式，保存后立即同步到大模型选区并可实时探测连接状态。
                 </p>
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
                     onClick={onProbeAll}
-                    className="h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-medium hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1.5"
+                    className="h-9 px-3 rounded-lg border wb-border text-xs font-medium wb-ink hover:opacity-80 inline-flex items-center gap-1.5"
                   >
                     <RefreshCw className="w-3.5 h-3.5" />
                     <span>全部检测状态</span>
@@ -189,7 +314,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <button
                     type="button"
                     onClick={startNew}
-                    className="h-9 px-3.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium inline-flex items-center gap-1.5"
+                    className="h-9 px-3.5 rounded-lg wb-accent text-xs font-medium inline-flex items-center gap-1.5"
                   >
                     <Plus className="w-3.5 h-3.5" />
                     <span>新增外接 API</span>
@@ -201,33 +326,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               {editingId && (
                 <form
                   onSubmit={handleSubmitProvider}
-                  className="rounded-xl border border-blue-200 dark:border-blue-900 bg-blue-50/40 dark:bg-blue-950/20 p-4 space-y-3"
+                  className="rounded-xl border border-blue-300 dark:border-blue-900 wb-tint p-4 space-y-3"
                 >
                   <div className="flex items-center justify-between">
-                    <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                    <span className="text-sm font-semibold wb-ink">
                       {editingId === '__new__' ? '添加外接 API 端点' : `编辑配置：${name}`}
                     </span>
                     <button
                       type="button"
                       onClick={() => setEditingId(null)}
-                      className="text-xs text-slate-500 hover:text-slate-800"
+                      className="text-xs wb-muted hover:wb-ink"
                     >
                       取消
                     </button>
                   </div>
 
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                    <label className="flex flex-col gap-1 text-xs text-slate-600 dark:text-slate-400">
+                    <label className="flex flex-col gap-1 text-xs wb-muted">
                       <span>显示名称</span>
                       <input
                         type="text"
                         required
                         value={name}
                         onChange={(e) => setName(e.target.value)}
-                        className="h-9 px-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"
+                        className="h-9 px-2.5 rounded-lg border wb-border wb-panel wb-ink"
                       />
                     </label>
-                    <label className="flex flex-col gap-1 text-xs text-slate-600 dark:text-slate-400">
+                    <label className="flex flex-col gap-1 text-xs wb-muted">
                       <span>协议类型</span>
                       <select
                         value={providerType}
@@ -237,7 +362,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           setBaseUrl(DEFAULT_BASE_BY_TYPE[t]);
                           setDirectStream(t !== 'gemini' && t !== 'workers-ai');
                         }}
-                        className="h-9 px-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"
+                        className="h-9 px-2.5 rounded-lg border wb-border wb-panel wb-ink"
                       >
                         <option value="openai-compatible">OpenAI 兼容端点</option>
                         <option value="deepseek">DeepSeek</option>
@@ -247,20 +372,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         <option value="gemini">Google Gemini</option>
                       </select>
                     </label>
-                    <label className="flex flex-col gap-1 text-xs text-slate-600 dark:text-slate-400">
+                    <label className="flex flex-col gap-1 text-xs wb-muted">
                       <span>Base URL / 端点地址</span>
                       <input
                         type="text"
                         value={baseUrl}
                         onChange={(e) => setBaseUrl(e.target.value)}
-                        className="h-9 px-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 font-mono text-slate-900 dark:text-slate-100"
+                        className="h-9 px-2.5 rounded-lg border wb-border wb-panel font-mono wb-ink"
                       />
                     </label>
                   </div>
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <label className="flex flex-col gap-1 text-xs text-slate-600 dark:text-slate-400">
-                      <span>API Key / Bearer Token（前端加密保存在本机浏览器）</span>
+                    <label className="flex flex-col gap-1 text-xs wb-muted">
+                      <span>API Key / Bearer Token（安全保存在本机浏览器）</span>
                       <input
                         type="password"
                         value={apiKey}
@@ -270,46 +395,46 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             ? '可选（若后端已配置 GEMINI_API_KEY 可留空）'
                             : 'sk-... / gsk_... / CF API Token'
                         }
-                        className="h-9 px-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 font-mono text-slate-900 dark:text-slate-100"
+                        className="h-9 px-2.5 rounded-lg border wb-border wb-panel font-mono wb-ink"
                       />
                     </label>
 
                     {providerType === 'workers-ai' ? (
-                      <label className="flex flex-col gap-1 text-xs text-slate-600 dark:text-slate-400">
+                      <label className="flex flex-col gap-1 text-xs wb-muted">
                         <span>Cloudflare Account ID</span>
                         <input
                           type="text"
                           value={accountId}
                           onChange={(e) => setAccountId(e.target.value)}
                           placeholder="32位 Cloudflare 账户 ID"
-                          className="h-9 px-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 font-mono text-slate-900 dark:text-slate-100"
+                          className="h-9 px-2.5 rounded-lg border wb-border wb-panel font-mono wb-ink"
                         />
                       </label>
                     ) : (
-                      <label className="flex flex-col gap-1 text-xs text-slate-600 dark:text-slate-400">
+                      <label className="flex flex-col gap-1 text-xs wb-muted">
                         <span>额度与限制备注</span>
                         <input
                           type="text"
                           value={quotaNote}
                           onChange={(e) => setQuotaNote(e.target.value)}
-                          className="h-9 px-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"
+                          className="h-9 px-2.5 rounded-lg border wb-border wb-panel wb-ink"
                         />
                       </label>
                     )}
                   </div>
 
-                  <label className="flex flex-col gap-1 text-xs text-slate-600 dark:text-slate-400">
+                  <label className="flex flex-col gap-1 text-xs wb-muted">
                     <span>自定义模型列表（每行一个模型 ID，保存后自动加入大模型选区）</span>
                     <textarea
                       rows={3}
                       value={modelsText}
                       onChange={(e) => setModelsText(e.target.value)}
-                      className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 font-mono text-xs text-slate-900 dark:text-slate-100"
+                      className="p-2.5 rounded-lg border wb-border wb-panel font-mono text-xs wb-ink"
                     />
                   </label>
 
                   <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
-                    <div className="flex flex-wrap items-center gap-4 text-xs text-slate-700 dark:text-slate-300">
+                    <div className="flex flex-wrap items-center gap-4 text-xs wb-ink">
                       <label className="inline-flex items-center gap-1.5 cursor-pointer">
                         <input
                           type="checkbox"
@@ -332,7 +457,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </div>
                     <button
                       type="submit"
-                      className="h-9 px-4 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium"
+                      className="h-9 px-4 rounded-lg wb-accent text-xs font-medium"
                     >
                       保存并检测连接
                     </button>
@@ -341,22 +466,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               )}
 
               {/* Provider List */}
-              <div className="divide-y divide-slate-200 dark:divide-slate-800 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+              <div className="divide-y wb-border border wb-border rounded-xl overflow-hidden">
                 {providers.map((p) => {
                   const st = providerStatuses[p.id] || { status: 'unconfigured', message: '未检测' };
                   const envInjected = hasEnvBackend(p);
                   return (
-                    <div key={p.id} className="p-4 bg-white dark:bg-slate-900 flex flex-col gap-2">
+                    <div key={p.id} className="p-4 wb-panel flex flex-col gap-2">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <div className="flex flex-wrap items-center gap-2.5 min-w-0">
-                          <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                            {p.name}
-                          </span>
+                          <span className="text-sm font-semibold wb-ink">{p.name}</span>
                           <StatusIndicator status={st.status} latencyMs={st.latencyMs} title={st.message} />
-                          <span className="text-xs text-slate-400" aria-hidden="true">
-                            ·
-                          </span>
-                          <span className="text-xs text-slate-500 dark:text-slate-400">
+                          <span className="text-xs wb-muted">
+                            ·{' '}
                             {p.source === 'custom' && p.apiKey
                               ? '前端已存密钥'
                               : envInjected
@@ -364,14 +485,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                               : '未配置密钥'}
                           </span>
                           {p.isFreeTier && (
-                            <>
-                              <span className="text-xs text-slate-400" aria-hidden="true">
-                                ·
-                              </span>
-                              <span className="text-xs text-emerald-700 dark:text-emerald-400 font-medium">
-                                免费额度
-                              </span>
-                            </>
+                            <span className="text-xs text-emerald-700 dark:text-emerald-400 font-medium">
+                              · 免费额度
+                            </span>
                           )}
                         </div>
 
@@ -379,14 +495,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           <button
                             type="button"
                             onClick={() => onProbeProvider(p)}
-                            className="h-8 px-2.5 rounded-lg border border-slate-200 dark:border-slate-800 text-xs hover:bg-slate-50 dark:hover:bg-slate-800"
+                            className="h-8 px-2.5 rounded-lg border wb-border text-xs wb-ink hover:opacity-80"
                           >
                             检测连接
                           </button>
                           <button
                             type="button"
                             onClick={() => startEdit(p)}
-                            className="h-8 px-2.5 rounded-lg border border-slate-200 dark:border-slate-800 text-xs hover:bg-slate-50 dark:hover:bg-slate-800"
+                            className="h-8 px-2.5 rounded-lg border wb-border text-xs wb-ink hover:opacity-80"
                           >
                             配置 / 模型列表
                           </button>
@@ -394,7 +510,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             <button
                               type="button"
                               onClick={() => onDeleteProvider(p.id)}
-                              className="h-8 w-8 rounded-lg border border-slate-200 dark:border-slate-800 flex items-center justify-center text-slate-500 hover:text-red-600"
+                              className="h-8 w-8 rounded-lg border wb-border flex items-center justify-center wb-muted hover:text-red-600"
                               title="删除外接 API"
                             >
                               <Trash2 className="w-3.5 h-3.5" />
@@ -403,12 +519,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         </div>
                       </div>
 
-                      <div className="text-xs text-slate-500 dark:text-slate-400 flex flex-wrap gap-x-3 gap-y-1">
-                        <span className="font-mono">{p.baseUrl}</span>
+                      <div className="text-xs wb-muted flex flex-wrap gap-x-3 gap-y-1">
+                        <span className="font-mono break-all">{p.baseUrl}</span>
                         <span>· {p.quotaNote}</span>
                         <span>· 状态详情：{st.message}</span>
                       </div>
-                      <div className="text-[11px] font-mono text-slate-400 dark:text-slate-500 truncate">
+                      <div className="text-[11px] font-mono wb-muted truncate">
                         模型 ({p.models.length}): {p.models.join(', ')}
                       </div>
                     </div>
@@ -417,8 +533,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
 
               {/* Global Generation Params & Reset */}
-              <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-4 flex flex-wrap items-center justify-between gap-4">
-                <label className="flex items-center gap-3 text-xs text-slate-700 dark:text-slate-300">
+              <div className="rounded-xl border wb-border p-4 flex flex-wrap items-center justify-between gap-4">
+                <label className="flex items-center gap-3 text-xs wb-ink">
                   <span>随机性 Temperature：</span>
                   <input
                     type="range"
@@ -435,7 +551,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <button
                   type="button"
                   onClick={onClearAllConversations}
-                  className="h-9 px-3.5 rounded-lg border border-red-200 dark:border-red-900/60 text-xs font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30"
+                  className="h-9 px-3.5 rounded-lg border border-red-300 dark:border-red-900/60 text-xs font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30"
                 >
                   清空所有历史对话
                 </button>
@@ -447,13 +563,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               {PROVIDER_GUIDES.map((g) => (
                 <div
                   key={g.providerType}
-                  className="rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-3"
+                  className="rounded-xl border wb-border p-4 space-y-3"
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
-                      <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                        {g.title}
-                      </h3>
+                      <h3 className="text-sm font-semibold wb-ink">{g.title}</h3>
                       <p className="text-xs text-emerald-700 dark:text-emerald-400 mt-0.5">
                         {g.badge} · {g.corsDirectSupport ? '支持客户端直连 SSE 流式' : '通过后端/边缘节点安全流式调用'}
                       </p>
@@ -462,39 +576,37 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       href={g.applyUrl}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="h-8 px-3 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1"
+                      className="h-8 px-3 rounded-lg border wb-border text-xs font-medium wb-accent-text hover:opacity-80 inline-flex items-center gap-1"
                     >
                       <span>前往获取凭证</span>
                       <ExternalLink className="w-3.5 h-3.5" />
                     </a>
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs bg-slate-50 dark:bg-slate-950 p-3 rounded-lg border border-slate-100 dark:border-slate-800">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs wb-bg p-3 rounded-lg border wb-border">
                     <div>
-                      <span className="text-slate-500">免费额度：</span>
-                      <span className="text-slate-800 dark:text-slate-200">{g.quotaDetail}</span>
+                      <span className="wb-muted">免费额度：</span>
+                      <span className="wb-ink">{g.quotaDetail}</span>
                     </div>
                     <div>
-                      <span className="text-slate-500">速率与上下文限制：</span>
-                      <span className="text-slate-800 dark:text-slate-200">{g.rateLimits}</span>
+                      <span className="wb-muted">速率与上下文限制：</span>
+                      <span className="wb-ink">{g.rateLimits}</span>
                     </div>
-                    <div className="md:col-span-2 font-mono text-[11px] text-slate-500">
+                    <div className="md:col-span-2 font-mono text-[11px] wb-muted break-all">
                       接口端点：{g.endpoint}
                     </div>
                   </div>
 
-                  <div className="space-y-1 text-xs text-slate-700 dark:text-slate-300">
-                    <div className="font-medium text-slate-900 dark:text-slate-100">详细接入流程：</div>
-                    <ol className="list-decimal pl-5 space-y-1">
+                  <div className="space-y-1 text-xs wb-ink">
+                    <div className="font-medium">详细接入流程：</div>
+                    <ol className="list-decimal pl-5 space-y-1 wb-muted">
                       {g.steps.map((s, idx) => (
                         <li key={idx}>{s}</li>
                       ))}
                     </ol>
                   </div>
 
-                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                    使用建议：{g.usageTips}
-                  </p>
+                  <p className="text-xs wb-muted">使用建议：{g.usageTips}</p>
                 </div>
               ))}
             </div>

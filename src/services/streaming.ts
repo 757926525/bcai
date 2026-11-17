@@ -1,9 +1,38 @@
-import { ExternalProvider, ProviderStatusInfo } from '../types';
+import { ChatAttachment, ExternalProvider, ProviderStatusInfo } from '../types';
 
 export interface StreamCallbacks {
   onChunk: (delta: string) => void;
   onDone: () => void;
   onError: (err: Error) => void;
+}
+
+export interface StreamMessagePayload {
+  role: string;
+  content: string;
+  attachments?: ChatAttachment[];
+}
+
+function buildDirectOpenAIMessages(messages: StreamMessagePayload[]): Array<{ role: string; content: unknown }> {
+  return messages.map((m) => {
+    let text = m.content || '';
+    const files = (m.attachments || []).filter((a) => a.kind === 'file' && a.textContent);
+    if (files.length > 0) {
+      text += files
+        .map((f) => `\n\n[附带文件: ${f.name} (${f.mimeType})]\n\`\`\`\n${(f.textContent || '').slice(0, 24000)}\n\`\`\``)
+        .join('');
+    }
+    const images = (m.attachments || []).filter((a) => a.kind === 'image' && a.dataUrl);
+    if (images.length > 0 && m.role === 'user') {
+      return {
+        role: m.role,
+        content: [
+          { type: 'text', text: text || '请结合附带的图片进行详细分析。' },
+          ...images.map((img) => ({ type: 'image_url', image_url: { url: img.dataUrl } })),
+        ],
+      };
+    }
+    return { role: m.role, content: text };
+  });
 }
 
 export async function probeProviderConnection(
@@ -13,7 +42,6 @@ export async function probeProviderConnection(
   const start = Date.now();
   const checkedAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
 
-  // Custom client-side probe when directStream is enabled and apiKey exists
   if (
     provider.source === 'custom' &&
     provider.directStream &&
@@ -96,7 +124,7 @@ export async function probeProviderConnection(
 export async function streamChatCompletion(params: {
   modelId: string;
   provider?: ExternalProvider;
-  messages: Array<{ role: string; content: string }>;
+  messages: StreamMessagePayload[];
   temperature: number;
   accessPassword?: string;
   signal: AbortSignal;
@@ -116,7 +144,6 @@ export async function streamChatCompletion(params: {
     let res: Response;
 
     if (canDirectClientStream && provider) {
-      // Direct secure client-side HTTPS SSE streaming
       const cleanBase = provider.baseUrl.replace(/\/+$/, '');
       const endpoint = cleanBase.endsWith('/chat/completions') ? cleanBase : `${cleanBase}/chat/completions`;
       res = await fetch(endpoint, {
@@ -128,13 +155,12 @@ export async function streamChatCompletion(params: {
         },
         body: JSON.stringify({
           model: modelId,
-          messages,
+          messages: buildDirectOpenAIMessages(messages),
           temperature,
           stream: true,
         }),
       });
     } else {
-      // Backend proxy SSE streaming (supports Gemini SDK, Workers AI, or backend env keys)
       const headers: Record<string, string> = { 'content-type': 'application/json' };
       if (accessPassword) {
         headers['x-access-password'] = encodeURIComponent(accessPassword);
@@ -195,7 +221,6 @@ export async function streamChatCompletion(params: {
           if (json?.error) {
             throw new Error(typeof json.error === 'string' ? json.error : json.error.message || '模型返回错误');
           }
-          // Support Workers AI ({ response }), OpenAI/DeepSeek/Groq ({ choices[0].delta }), and reasoning_content
           const deltaObj = json?.choices?.[0]?.delta;
           let piece = '';
           if (typeof json?.response === 'string') {
