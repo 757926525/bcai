@@ -86,6 +86,9 @@ export interface ChatMessage {
   attachments?: ChatAttachment[];
   createdAt: string;
   paused?: boolean;
+  truncated?: boolean;
+  interrupted?: boolean;
+  finishReason?: string;
 }
 
 export interface Conversation {

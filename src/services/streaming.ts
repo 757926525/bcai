@@ -1,8 +1,24 @@
 import { ChatAttachment, ExternalProvider, ProviderStatusInfo } from '../types';
 
+export interface StreamMetaEvent {
+  phase?: 'connecting' | 'thinking' | 'writing' | 'fallback' | 'truncated' | 'done';
+  model?: string;
+  fromModel?: string;
+  finishReason?: string;
+  truncated?: boolean;
+}
+
+export interface StreamDoneResult {
+  truncated: boolean;
+  interrupted: boolean;
+  finishReason?: string;
+  activeModel?: string;
+}
+
 export interface StreamCallbacks {
   onChunk: (delta: string) => void;
-  onDone: () => void;
+  onMeta?: (meta: StreamMetaEvent) => void;
+  onDone: (result: StreamDoneResult) => void;
   onError: (err: Error) => void;
 }
 
@@ -121,6 +137,13 @@ export async function probeProviderConnection(
   }
 }
 
+class UpstreamStreamError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UpstreamStreamError';
+  }
+}
+
 export async function streamChatCompletion(params: {
   modelId: string;
   provider?: ExternalProvider;
@@ -140,46 +163,58 @@ export async function streamChatCompletion(params: {
     provider.providerType !== 'gemini' &&
     provider.providerType !== 'workers-ai';
 
+  const fetchBackendProxy = () => {
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (accessPassword) {
+      headers['x-access-password'] = encodeURIComponent(accessPassword);
+    }
+    return fetch('/api/chat', {
+      method: 'POST',
+      signal,
+      headers,
+      body: JSON.stringify({
+        model: modelId,
+        messages,
+        temperature,
+        providerType: provider?.providerType || (modelId.startsWith('@cf/') ? 'workers-ai' : 'openai-compatible'),
+        source: provider?.source || 'env',
+        baseUrl: provider?.baseUrl,
+        apiKey: provider?.source === 'custom' ? provider.apiKey : undefined,
+        accountId: provider?.source === 'custom' ? provider.accountId : undefined,
+      }),
+    });
+  };
+
   try {
-    let res: Response;
+    let res: Response | null = null;
 
     if (canDirectClientStream && provider) {
       const cleanBase = provider.baseUrl.replace(/\/+$/, '');
       const endpoint = cleanBase.endsWith('/chat/completions') ? cleanBase : `${cleanBase}/chat/completions`;
-      res = await fetch(endpoint, {
-        method: 'POST',
-        signal,
-        headers: {
-          authorization: `Bearer ${provider.apiKey.trim()}`,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: modelId,
-          messages: buildDirectOpenAIMessages(messages),
-          temperature,
-          stream: true,
-        }),
-      });
-    } else {
-      const headers: Record<string, string> = { 'content-type': 'application/json' };
-      if (accessPassword) {
-        headers['x-access-password'] = encodeURIComponent(accessPassword);
+      try {
+        res = await fetch(endpoint, {
+          method: 'POST',
+          signal,
+          headers: {
+            authorization: `Bearer ${provider.apiKey.trim()}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: modelId,
+            messages: buildDirectOpenAIMessages(messages),
+            temperature,
+            stream: true,
+          }),
+        });
+      } catch (directErr: any) {
+        if (directErr?.name === 'AbortError' || signal.aborted) {
+          throw directErr;
+        }
+        // Automatic fallback to backend /api/chat proxy if CORS or network blocks direct browser SSE
+        res = await fetchBackendProxy();
       }
-      res = await fetch('/api/chat', {
-        method: 'POST',
-        signal,
-        headers,
-        body: JSON.stringify({
-          model: modelId,
-          messages,
-          temperature,
-          providerType: provider?.providerType || (modelId.startsWith('@cf/') ? 'workers-ai' : 'openai-compatible'),
-          source: provider?.source || 'env',
-          baseUrl: provider?.baseUrl,
-          apiKey: provider?.source === 'custom' ? provider.apiKey : undefined,
-          accountId: provider?.source === 'custom' ? provider.accountId : undefined,
-        }),
-      });
+    } else {
+      res = await fetchBackendProxy();
     }
 
     if (!res.ok) {
@@ -210,36 +245,70 @@ export async function streamChatCompletion(params: {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let receivedDone = false;
+    let truncated = false;
+    let finishReason: string | undefined;
+    let activeModel = modelId;
+    let receivedContent = false;
 
     const processLine = (line: string) => {
       const trimmed = line.trim();
-      if (!trimmed.startsWith('data:')) return;
+      if (!trimmed || trimmed.startsWith(':') || !trimmed.startsWith('data:')) return;
       const payload = trimmed.slice(5).trim();
-      if (!payload || payload === '[DONE]') return;
+      if (!payload) return;
+      if (payload === '[DONE]') {
+        receivedDone = true;
+        return;
+      }
+
+      let json: any;
       try {
-        const json = JSON.parse(payload);
-        if (json?.error) {
-          throw new Error(typeof json.error === 'string' ? json.error : json.error.message || '模型返回错误');
+        json = JSON.parse(payload);
+      } catch {
+        // Ignore partial/non-JSON keepalive lines instead of breaking the stream
+        return;
+      }
+
+      if (json?.error) {
+        throw new UpstreamStreamError(typeof json.error === 'string' ? json.error : json.error.message || '模型返回错误');
+      }
+
+      if (json?.meta) {
+        const meta = json.meta as StreamMetaEvent;
+        if (meta.model) activeModel = meta.model;
+        if (meta.finishReason) finishReason = meta.finishReason;
+        if (meta.truncated) truncated = true;
+        callbacks.onMeta?.(meta);
+        return;
+      }
+
+      const choiceFinish = json?.choices?.[0]?.finish_reason;
+      if (choiceFinish) {
+        finishReason = String(choiceFinish);
+        if (choiceFinish === 'length') {
+          truncated = true;
+          callbacks.onMeta?.({ phase: 'truncated', finishReason: 'length', truncated: true, model: activeModel });
         }
-        const deltaObj = json?.choices?.[0]?.delta;
-        let piece = '';
-        if (typeof json?.response === 'string') {
-          piece = json.response;
-        } else if (deltaObj) {
-          if (typeof deltaObj.reasoning_content === 'string' && deltaObj.reasoning_content) {
-            piece = deltaObj.reasoning_content;
-          }
-          if (typeof deltaObj.content === 'string' && deltaObj.content) {
-            piece += deltaObj.content;
-          }
+      }
+
+      const deltaObj = json?.choices?.[0]?.delta;
+      let piece = '';
+      if (typeof json?.response === 'string') {
+        piece = json.response;
+      } else if (deltaObj) {
+        if (typeof deltaObj.reasoning_content === 'string' && deltaObj.reasoning_content) {
+          piece = deltaObj.reasoning_content;
         }
-        if (piece) {
-          callbacks.onChunk(piece);
+        if (typeof deltaObj.content === 'string' && deltaObj.content) {
+          piece += deltaObj.content;
         }
-      } catch (parseErr: any) {
-        if (parseErr?.message && !parseErr.message.includes('JSON')) {
-          throw parseErr;
+      }
+      if (piece) {
+        if (!receivedContent) {
+          receivedContent = true;
+          callbacks.onMeta?.({ phase: 'writing', model: activeModel });
         }
+        callbacks.onChunk(piece);
       }
     };
 
@@ -257,7 +326,13 @@ export async function streamChatCompletion(params: {
       processLine(buffer);
     }
 
-    callbacks.onDone();
+    const interrupted = !receivedDone && !signal.aborted && receivedContent;
+    callbacks.onDone({
+      truncated,
+      interrupted,
+      finishReason,
+      activeModel,
+    });
   } catch (err: any) {
     callbacks.onError(err instanceof Error ? err : new Error(String(err)));
   }

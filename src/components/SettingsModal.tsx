@@ -449,20 +449,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <label className="flex flex-col gap-1 text-xs wb-muted">
-                      <span>API Key / Bearer Token（安全保存在本机浏览器）</span>
-                      <input
-                        type="password"
-                        value={apiKey}
-                        onChange={(e) => setApiKey(e.target.value)}
-                        placeholder={
-                          providerType === 'gemini'
-                            ? '可选（若后端已配置 GEMINI_API_KEY 可留空）'
-                            : 'sk-... / gsk_... / CF API Token'
-                        }
-                        className="h-9 px-2.5 rounded-lg border wb-border wb-panel font-mono wb-ink"
-                      />
-                    </label>
+                    {providerType === 'gemini' ? (
+                      <div className="flex flex-col justify-center gap-1 rounded-lg border wb-border wb-panel px-3 py-2 text-xs wb-muted">
+                        <span className="font-medium wb-ink">Google Gemini 密钥由后端环境安全托管</span>
+                        <span>使用服务端 GEMINI_API_KEY 环境变量安全调用，无需在前端填写密钥。</span>
+                      </div>
+                    ) : (
+                      <label className="flex flex-col gap-1 text-xs wb-muted">
+                        <span>API Key / Bearer Token（安全保存在本机浏览器）</span>
+                        <input
+                          type="password"
+                          value={apiKey}
+                          onChange={(e) => setApiKey(e.target.value)}
+                          placeholder="sk-... / gsk_... / CF API Token"
+                          className="h-9 px-2.5 rounded-lg border wb-border wb-panel font-mono wb-ink"
+                        />
+                      </label>
+                    )}
 
                     {providerType === 'workers-ai' ? (
                       <label className="flex flex-col gap-1 text-xs wb-muted">

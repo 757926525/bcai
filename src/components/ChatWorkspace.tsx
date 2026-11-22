@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
 import {
   ChevronDown,
@@ -28,8 +28,15 @@ import {
   ModelOption,
   ProviderStatusInfo,
 } from '../types';
+import {
+  extractCodeBlocks,
+  hasUnclosedCodeFence,
+  LANG_EXT_MAP,
+  suggestCodeFilename,
+} from '../utils/codeBlocks';
 import { formatBytes, formatDateTime, formatTimeShort, loadLocalJson, saveLocalJson, uid } from '../utils/format';
 import { MarkdownRenderer } from './MarkdownRenderer';
+import { ProjectStatusLights, ProjectWritePhase } from './StatusIndicator';
 
 interface ChatWorkspaceProps {
   conversation: Conversation;
@@ -37,6 +44,11 @@ interface ChatWorkspaceProps {
   activeModel?: ModelOption;
   providerStatus?: ProviderStatusInfo;
   isStreaming: boolean;
+  writePhase: ProjectWritePhase;
+  activeStreamModel?: string;
+  streamStartedAt?: number | null;
+  autoContinue: boolean;
+  onToggleAutoContinue: () => void;
   isAdmin: boolean;
   isMobileLayout: boolean;
   connectors?: ConnectorItem[];
@@ -45,8 +57,8 @@ interface ChatWorkspaceProps {
   onTogglePauseSession: () => void;
   onResumePartial: () => void;
   onClearAttachedFile: () => void;
-  onSaveCodeToDb: (code: string, lang: string) => void;
-  onSendCodeToRepo: (code: string, lang: string) => void;
+  onSaveCodeToDb: (code: string, lang: string, filename?: string) => void;
+  onSendCodeToRepo: (code: string, lang: string, filename?: string) => void;
   onSaveCodeToConnector?: (
     connectorId: string,
     filename: string,
@@ -64,45 +76,17 @@ interface ChatWorkspaceProps {
 
 const LS_SCRATCHPAD = 'bcai.scratchpad.v1';
 
-const LANG_EXT_MAP: Record<string, string> = {
-  typescript: 'ts',
-  ts: 'ts',
-  tsx: 'tsx',
-  javascript: 'js',
-  js: 'js',
-  jsx: 'jsx',
-  python: 'py',
-  py: 'py',
-  json: 'json',
-  html: 'html',
-  css: 'css',
-  sql: 'sql',
-  bash: 'sh',
-  sh: 'sh',
-  markdown: 'md',
-  md: 'md',
-  yaml: 'yml',
-  yml: 'yml',
-  toml: 'toml',
-  rust: 'rs',
-  go: 'go',
-};
-
-function extractCodeBlocks(markdown: string): Array<{ lang: string; code: string }> {
-  const blocks: Array<{ lang: string; code: string }> = [];
-  const regex = /```([\w+#.-]*)[^\S\n]*\n([\s\S]*?)```/g;
-  let m: RegExpExecArray | null;
-  while ((m = regex.exec(markdown)) !== null) {
-    blocks.push({ lang: (m[1] || 'txt').trim(), code: m[2].trimEnd() });
-  }
-  return blocks;
-}
-
 export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   conversation,
   allConversations,
   activeModel,
+  providerStatus,
   isStreaming,
+  writePhase,
+  activeStreamModel,
+  streamStartedAt,
+  autoContinue,
+  onToggleAutoContinue,
   isAdmin,
   isMobileLayout,
   connectors = [],
@@ -127,7 +111,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   const [scratchpad, setScratchpad] = useState<string>(() => loadLocalJson(LS_SCRATCHPAD, ''));
 
   // Connector save modal state
-  const [connectorModalCode, setConnectorModalCode] = useState<{ code: string; lang: string } | null>(null);
+  const [connectorModalCode, setConnectorModalCode] = useState<{ code: string; lang: string; filename?: string } | null>(null);
   const [selectedConnectorId, setSelectedConnectorId] = useState('');
   const [saveFilename, setSaveFilename] = useState('');
   const [saveTargetDir, setSaveTargetDir] = useState('bcai-code');
@@ -158,13 +142,13 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
   };
 
-  const openConnectorPicker = (code: string, lang: string) => {
+  const openConnectorPicker = (code: string, lang: string, filename?: string) => {
     const ext = LANG_EXT_MAP[lang.toLowerCase()] || lang || 'txt';
     const preferred = connectors.find((c) => c.status === 'connected') || connectors[0];
     setSelectedConnectorId(preferred?.id || '');
-    setSaveFilename(`bcai-${Date.now().toString().slice(-5)}.${ext}`);
+    setSaveFilename(filename ? filename.split('/').pop() || `bcai-${Date.now().toString().slice(-5)}.${ext}` : `bcai-${Date.now().toString().slice(-5)}.${ext}`);
     setSaveTargetDir(preferred?.extraConfig || 'bcai-code');
-    setConnectorModalCode({ code, lang });
+    setConnectorModalCode({ code, lang, filename });
   };
 
   const handleConfirmConnectorSave = async (e: React.FormEvent) => {
@@ -233,8 +217,8 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
 
     const customFile =
       arg && /\.[a-z0-9]{1,8}$/i.test(arg)
-        ? arg.split(/\s+/).find((t) => /\.[a-z0-9]{1,8}$/i.test(t)) || `code-${Date.now().toString().slice(-5)}.${ext}`
-        : `code-${Date.now().toString().slice(-5)}.${ext}`;
+        ? arg.split(/\s+/).find((t) => /\.[a-z0-9]{1,8}$/i.test(t)) || latest.filename?.split('/').pop() || `code-${Date.now().toString().slice(-5)}.${ext}`
+        : latest.filename?.split('/').pop() || `code-${Date.now().toString().slice(-5)}.${ext}`;
 
     try {
       const res = await onSaveCodeToConnector(
@@ -246,7 +230,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
       );
       onAppendLocalExchange?.(
         rawText,
-        `✅ 已通过对话指令将最近生成的代码（\`${latest.lang}\`，${latest.code.length} 字符）存入连接器 **${matchedConn.name}**。\n\n- 保存结果：${res.message}\n- 提示：你也可以随时点击任意代码块右上角的 **「存入连接器」** 指定文件名与目录。`
+        `✅ 已通过对话指令将最近生成的代码（\`${customFile}\`，${latest.code.length} 字符）存入连接器 **${matchedConn.name}**。\n\n- 保存结果：${res.message}\n- 提示：你也可以随时点击任意代码块右上角的 **「存入连接器」** 指定文件名与目录。`
       );
       onShowToast(res.message);
     } catch (err: any) {
@@ -330,11 +314,16 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
 
   const handleDownloadMessageZip = async (msg: ChatMessage) => {
     const zip = new JSZip();
-    zip.file('response.md', msg.content || '');
+    zip.file('README-reply.md', msg.content || '');
     const blocks = extractCodeBlocks(msg.content || '');
+    const usedNames = new Set<string>();
     blocks.forEach((b, idx) => {
-      const ext = LANG_EXT_MAP[b.lang.toLowerCase()] || b.lang || 'txt';
-      zip.file(`code-${idx + 1}.${ext}`, b.code);
+      let targetPath = suggestCodeFilename(b.lang, idx, b.filename);
+      if (usedNames.has(targetPath)) {
+        targetPath = `module-${idx + 1}-${targetPath.split('/').pop()}`;
+      }
+      usedNames.add(targetPath);
+      zip.file(targetPath, b.code);
     });
     if (msg.attachments && msg.attachments.length > 0) {
       for (const att of msg.attachments) {
@@ -350,16 +339,17 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `bcai-reply-${msg.id.slice(0, 6)}.zip`;
+    a.download = `bcai-project-${msg.id.slice(0, 6)}.zip`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    onShowToast('已打包下载回复与代码压缩包 (.zip)');
+    onShowToast(`已按目录结构打包下载 ${blocks.length} 个代码文件 (.zip)`);
   };
 
   const handleDownloadConversationZip = async () => {
     const zip = new JSZip();
     const mdLines: string[] = [`# ${conversation.title}`, `导出时间: ${new Date().toLocaleString('zh-CN')}`, ''];
-    let codeCount = 0;
+    const fileMap = new Map<string, string>();
+    let unnamedCounter = 0;
 
     for (const m of conversation.messages) {
       mdLines.push(`## ${m.role === 'user' ? '用户' : m.modelId || '助手'} (${formatDateTime(m.createdAt)})`);
@@ -369,9 +359,12 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
       if (m.role === 'assistant') {
         const blocks = extractCodeBlocks(m.content || '');
         for (const b of blocks) {
-          codeCount += 1;
-          const ext = LANG_EXT_MAP[b.lang.toLowerCase()] || b.lang || 'txt';
-          zip.file(`code/snippet-${codeCount}.${ext}`, b.code);
+          if (b.filename) {
+            fileMap.set(b.filename, b.code);
+          } else {
+            const name = suggestCodeFilename(b.lang, unnamedCounter++);
+            fileMap.set(`code/${name}`, b.code);
+          }
         }
       }
       if (m.attachments) {
@@ -385,6 +378,9 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
         }
       }
     }
+    for (const [fPath, content] of fileMap.entries()) {
+      zip.file(fPath, content);
+    }
     zip.file('conversation.md', mdLines.join('\n'));
     const blob = await zip.generateAsync({ type: 'blob' });
     const url = URL.createObjectURL(blob);
@@ -393,7 +389,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     a.download = `bcai-session-${conversation.id.slice(0, 6)}.zip`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    onShowToast('已打包下载当前会话全部代码与附件 (.zip)');
+    onShowToast(`已打包下载项目代码 (${fileMap.size} 个文件) 与会话记录 (.zip)`);
   };
 
   const handleDownloadScratchpad = () => {
@@ -424,15 +420,66 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   };
 
   const lastMessage = conversation.messages[conversation.messages.length - 1];
+  const lastIsAssistant = lastMessage?.role === 'assistant';
+  const lastHasUnclosed = lastIsAssistant && hasUnclosedCodeFence(lastMessage?.content || '');
+
   const canContinuePartial =
     !isStreaming &&
     conversation.status === 'active' &&
-    lastMessage?.role === 'assistant' &&
-    lastMessage?.paused;
+    lastIsAssistant &&
+    Boolean(lastMessage?.paused || lastMessage?.truncated || lastMessage?.interrupted || lastHasUnclosed);
+
+  // Live metrics for ProjectStatusLights
+  const projectMetrics = useMemo(() => {
+    const assistantMessages = conversation.messages.filter((m) => m.role === 'assistant');
+    const latestAsst = assistantMessages[assistantMessages.length - 1];
+    const latestBlocks = latestAsst ? extractCodeBlocks(latestAsst.content || '') : [];
+    const sessionBlocks = assistantMessages.flatMap((m) => extractCodeBlocks(m.content || ''));
+    const activeBlocks = latestBlocks.length > 0 ? latestBlocks : sessionBlocks;
+
+    const totalCodeLines = activeBlocks.reduce(
+      (sum, b) => sum + (b.code ? b.code.split('\n').length : 0),
+      0
+    );
+    const codeFileNames = Array.from(
+      new Set(activeBlocks.map((b, i) => suggestCodeFilename(b.lang, i, b.filename)))
+    );
+    const generatedChars = latestAsst?.content?.length || 0;
+    const hasUnclosed = latestAsst ? hasUnclosedCodeFence(latestAsst.content || '') : false;
+
+    return {
+      codeBlockCount: activeBlocks.length,
+      sessionBlockCount: sessionBlocks.length,
+      totalCodeLines,
+      codeFileNames,
+      generatedChars,
+      hasUnclosed,
+    };
+  }, [conversation.messages]);
 
   return (
     <div className="flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden">
-      {/* Messages Viewport (Clean full height without top pause bar for better mobile viewing) */}
+      {/* Live Project Writing Status Indicator Lights */}
+      <ProjectStatusLights
+        mode={conversation.mode}
+        phase={writePhase}
+        isStreaming={isStreaming}
+        modelId={conversation.modelId}
+        activeStreamModel={activeStreamModel}
+        providerStatus={providerStatus}
+        streamStartedAt={streamStartedAt}
+        codeBlockCount={projectMetrics.codeBlockCount}
+        codeFileNames={projectMetrics.codeFileNames}
+        totalCodeLines={projectMetrics.totalCodeLines}
+        generatedChars={projectMetrics.generatedChars}
+        hasUnclosedCode={projectMetrics.hasUnclosed}
+        autoContinue={autoContinue}
+        onToggleAutoContinue={onToggleAutoContinue}
+        onExportProjectZip={handleDownloadConversationZip}
+        canExportZip={projectMetrics.sessionBlockCount > 0}
+      />
+
+      {/* Messages Viewport */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-3 sm:px-4 py-3 sm:py-5 min-w-0">
         <div className="max-w-3xl mx-auto space-y-5 min-w-0">
           {conversation.attachedFilePath && (
@@ -457,14 +504,14 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
               <div className="space-y-1.5">
                 <h1 className="text-xl sm:text-2xl font-semibold wb-ink">
                   {conversation.mode === 'code'
-                    ? '编写、重构与调试完整代码'
+                    ? '编写、重构与调试完整项目代码'
                     : conversation.mode === 'repo'
                     ? '基于 Git 仓库分支协同编程'
                     : '多模态文件/图片与自由流式对话'}
                 </h1>
                 <p className="text-xs sm:text-sm wb-muted max-w-lg mx-auto leading-relaxed">
-                  支持上传代码文件或截图提问、打包下载 ZIP、连接器接入后可直接在对话发送{' '}
-                  <code className="font-mono">/save</code> 或点击代码块「存入连接器」将代码存至网盘。
+                  内置实时项目编写状态灯与防中断续写引擎；支持 HTML 在线沙盒预览、按目录导出项目 ZIP、发送{' '}
+                  <code className="font-mono">/save</code> 存入连接器。
                 </p>
               </div>
               <div className="flex flex-col gap-2 max-w-xl mx-auto">
@@ -482,86 +529,107 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
               </div>
             </div>
           ) : (
-            conversation.messages.map((m) => (
-              <div
-                key={m.id}
-                className={`flex flex-col min-w-0 ${m.role === 'user' ? 'items-end' : 'items-start'}`}
-              >
-                <div className="flex flex-wrap items-center gap-2 text-[11px] wb-muted mb-1 px-1 tabular-nums">
-                  <span>{m.role === 'user' ? '我' : m.modelId || conversation.modelId}</span>
-                  <span aria-hidden="true">·</span>
-                  <span>{formatTimeShort(m.createdAt)}</span>
-                  {m.paused && (
-                    <>
-                      <span aria-hidden="true">·</span>
-                      <span className="text-amber-600 dark:text-amber-400 font-medium">已中止/暂停</span>
-                    </>
+            conversation.messages.map((m) => {
+              const blocks = m.role === 'assistant' ? extractCodeBlocks(m.content || '') : [];
+              const isStreamingThis = isStreaming && m.id === lastMessage?.id;
+              return (
+                <div
+                  key={m.id}
+                  className={`flex flex-col min-w-0 ${m.role === 'user' ? 'items-end' : 'items-start'}`}
+                >
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] wb-muted mb-1 px-1 tabular-nums">
+                    <span>{m.role === 'user' ? '我' : m.modelId || conversation.modelId}</span>
+                    <span aria-hidden="true">·</span>
+                    <span>{formatTimeShort(m.createdAt)}</span>
+                    {m.paused && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="text-amber-600 dark:text-amber-400 font-medium">已暂停</span>
+                      </>
+                    )}
+                    {m.truncated && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="text-amber-600 dark:text-amber-400 font-medium">达到输出上限，可续写</span>
+                      </>
+                    )}
+                    {m.interrupted && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="text-red-600 dark:text-red-400 font-medium">流式意外中断，可续写</span>
+                      </>
+                    )}
+                  </div>
+
+                  {m.role === 'user' ? (
+                    <div className="max-w-[92%] sm:max-w-[85%] rounded-2xl rounded-tr-sm wb-accent px-3.5 sm:px-4 py-2.5 text-sm sm:text-[15px] leading-relaxed whitespace-pre-wrap break-words space-y-2">
+                      {m.attachments && m.attachments.length > 0 && (
+                        <div className="flex flex-wrap gap-2">
+                          {m.attachments.map((att) =>
+                            att.kind === 'image' && att.dataUrl ? (
+                              <div key={att.id} className="rounded-lg overflow-hidden border border-white/20 bg-black/20">
+                                <img
+                                  src={att.dataUrl}
+                                  alt={att.name}
+                                  className="max-h-44 max-w-[220px] object-contain block"
+                                />
+                                <div className="px-2 py-1 flex items-center justify-between gap-2 text-[11px] bg-black/30">
+                                  <span className="truncate max-w-[140px]">{att.name}</span>
+                                  <a
+                                    href={att.dataUrl}
+                                    download={att.name}
+                                    className="underline hover:opacity-80 shrink-0"
+                                  >
+                                    下载图片
+                                  </a>
+                                </div>
+                              </div>
+                            ) : (
+                              <span
+                                key={att.id}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white/15 text-xs font-mono"
+                              >
+                                <FileText className="w-3.5 h-3.5 shrink-0" />
+                                <span className="truncate max-w-[180px]">{att.name}</span>
+                              </span>
+                            )
+                          )}
+                        </div>
+                      )}
+                      <div>{m.content}</div>
+                    </div>
+                  ) : (
+                    <div className="w-full min-w-0 rounded-xl border wb-border wb-panel px-3.5 sm:px-4 py-3 sm:py-3.5 space-y-2.5">
+                      <MarkdownRenderer
+                        content={m.content}
+                        isStreamingMessage={isStreamingThis}
+                        onSaveCodeToDb={isAdmin ? onSaveCodeToDb : undefined}
+                        onSendCodeToRepo={isAdmin ? onSendCodeToRepo : undefined}
+                        onSaveCodeToConnector={isAdmin && onSaveCodeToConnector ? openConnectorPicker : undefined}
+                        repoConnected={repoConnected}
+                      />
+                      {m.content && (
+                        <div className="pt-2 border-t wb-border flex flex-wrap items-center justify-between gap-2 text-[11px] wb-muted">
+                          <span>
+                            {blocks.length > 0
+                              ? `包含 ${blocks.length} 个代码文件/模块`
+                              : `文本回复 · ${m.content.length} 字`}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleDownloadMessageZip(m)}
+                            className="inline-flex items-center gap-1 wb-accent-text hover:underline font-medium"
+                          >
+                            <FileArchive className="w-3.5 h-3.5" />
+                            <span>打包下载 ZIP</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   )}
                 </div>
-
-                {m.role === 'user' ? (
-                  <div className="max-w-[92%] sm:max-w-[85%] rounded-2xl rounded-tr-sm wb-accent px-3.5 sm:px-4 py-2.5 text-sm sm:text-[15px] leading-relaxed whitespace-pre-wrap break-words space-y-2">
-                    {m.attachments && m.attachments.length > 0 && (
-                      <div className="flex flex-wrap gap-2">
-                        {m.attachments.map((att) =>
-                          att.kind === 'image' && att.dataUrl ? (
-                            <div key={att.id} className="rounded-lg overflow-hidden border border-white/20 bg-black/20">
-                              <img
-                                src={att.dataUrl}
-                                alt={att.name}
-                                className="max-h-44 max-w-[220px] object-contain block"
-                              />
-                              <div className="px-2 py-1 flex items-center justify-between gap-2 text-[11px] bg-black/30">
-                                <span className="truncate max-w-[140px]">{att.name}</span>
-                                <a
-                                  href={att.dataUrl}
-                                  download={att.name}
-                                  className="underline hover:opacity-80 shrink-0"
-                                >
-                                  下载图片
-                                </a>
-                              </div>
-                            </div>
-                          ) : (
-                            <span
-                              key={att.id}
-                              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white/15 text-xs font-mono"
-                            >
-                              <FileText className="w-3.5 h-3.5 shrink-0" />
-                              <span className="truncate max-w-[180px]">{att.name}</span>
-                            </span>
-                          )
-                        )}
-                      </div>
-                    )}
-                    <div>{m.content}</div>
-                  </div>
-                ) : (
-                  <div className="w-full min-w-0 rounded-xl border wb-border wb-panel px-3.5 sm:px-4 py-3 sm:py-3.5 space-y-2.5">
-                    <MarkdownRenderer
-                      content={m.content}
-                      onSaveCodeToDb={isAdmin ? onSaveCodeToDb : undefined}
-                      onSendCodeToRepo={isAdmin ? onSendCodeToRepo : undefined}
-                      onSaveCodeToConnector={isAdmin && onSaveCodeToConnector ? openConnectorPicker : undefined}
-                      repoConnected={repoConnected}
-                    />
-                    {m.content && (
-                      <div className="pt-2 border-t wb-border flex flex-wrap items-center justify-between gap-2 text-[11px] wb-muted">
-                        <span>{extractCodeBlocks(m.content).length > 0 ? `包含 ${extractCodeBlocks(m.content).length} 个代码块` : '文本回复'}</span>
-                        <button
-                          type="button"
-                          onClick={() => handleDownloadMessageZip(m)}
-                          className="inline-flex items-center gap-1 wb-accent-text hover:underline font-medium"
-                        >
-                          <FileArchive className="w-3.5 h-3.5" />
-                          <span>打包下载 ZIP</span>
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            ))
+              );
+            })
           )}
         </div>
       </div>
@@ -726,7 +794,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                     className="h-9 px-3 rounded-lg wb-accent text-xs font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
                   >
                     <FileArchive className="w-3.5 h-3.5" />
-                    <span>下载当前对话代码与图片包 (.zip)</span>
+                    <span>打包下载完整项目代码与图片 (.zip)</span>
                   </button>
                   <button
                     type="button"
@@ -765,13 +833,24 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
 
           {canContinuePartial && (
             <div className="mb-2 flex items-center justify-between px-3 py-1.5 rounded-lg border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/30 text-xs text-amber-800 dark:text-amber-300">
-              <span>上一条回复已暂停，保留已生成片段。</span>
+              <span className="inline-flex items-center gap-1.5 min-w-0">
+                <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse shrink-0" />
+                <span className="truncate">
+                  {lastMessage?.interrupted
+                    ? '检测到上次流式连接中断，已完整保留已生成内容。'
+                    : lastMessage?.truncated
+                    ? '长内容已达单轮输出上限，保留前文并可无缝续写。'
+                    : lastHasUnclosed
+                    ? '检测到代码块尚未闭合，可点击右侧无缝补全剩余代码。'
+                    : '上一条回复已暂停，保留已生成片段。'}
+                </span>
+              </span>
               <button
                 type="button"
                 onClick={onResumePartial}
                 className="font-semibold underline underline-offset-2 shrink-0 ml-2"
               >
-                继续生成
+                断点续写
               </button>
             </div>
           )}
@@ -797,8 +876,8 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                 conversation.status === 'paused'
                   ? '当前会话已暂停，请点击右上角恢复会话继续对话'
                   : isMobileLayout
-                  ? '输入指令、/save 存代码或上传图文提问…'
-                  : '输入指令、/save 文件名 存入连接器，或附带文件图片提问（Enter 发送）'
+                  ? '输入编程需求、/save 存代码或上传文件提问…'
+                  : '输入编程需求、/save 文件名 存入连接器，或附带文件图片提问（Enter 发送）'
               }
               className="flex-1 min-w-0 bg-transparent px-2 py-2 text-sm wb-ink placeholder:opacity-50 resize-none max-h-[180px] focus:outline-none disabled:opacity-50"
             />
@@ -861,7 +940,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                 }`}
               >
                 <Download className="w-3.5 h-3.5 wb-accent-text" />
-                <span>下载文件</span>
+                <span>下载项目/文件</span>
               </button>
 
               <button

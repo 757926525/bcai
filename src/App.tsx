@@ -35,6 +35,7 @@ import { GitHubWorkspace } from './components/GitHubWorkspace';
 import { ImageWorkspace } from './components/ImageWorkspace';
 import { ModelSelectorPopover } from './components/ModelSelectorPopover';
 import { SettingsModal } from './components/SettingsModal';
+import { ProjectWritePhase } from './components/StatusIndicator';
 import {
   DEFAULT_FREE_EXTENDED_MODELS,
   DEFAULT_PROVIDERS,
@@ -60,6 +61,7 @@ import {
   ThemeId,
   WorkspaceMode,
 } from './types';
+import { hasUnclosedCodeFence, LANG_EXT_MAP } from './utils/codeBlocks';
 import { formatTimeShort, loadLocalJson, saveLocalJson, uid } from './utils/format';
 
 const LS_CONVS = 'bcai.convs.v3';
@@ -71,6 +73,7 @@ const LS_THEME_DARK = 'bcai.dark.v3';
 const LS_THEME_ID = 'bcai.themeId.v3';
 const LS_LAYOUT_MODE = 'bcai.layoutMode.v3';
 const LS_TARGET_REPO = 'bcai.targetRepo.v3';
+const LS_AUTO_CONTINUE = 'bcai.autoContinue.v1';
 
 function parseRepoSlug(urlOrSlug: string): string {
   const clean = (urlOrSlug || '').trim().replace(/\/+$/, '');
@@ -356,7 +359,7 @@ export default function App() {
   const [dbDrawerOpen, setDbDrawerOpen] = useState(false);
   const [deployModalOpen, setDeployModalOpen] = useState(false);
   const [exportModalOpen, setExportModalOpen] = useState(false);
-  const [pendingRepoCode, setPendingRepoCode] = useState<{ code: string; lang: string } | null>(null);
+  const [pendingRepoCode, setPendingRepoCode] = useState<{ code: string; lang: string; filename?: string } | null>(null);
   const [connectors, setConnectors] = useState<ConnectorItem[]>([]);
   const [gatePw, setGatePw] = useState('');
   const [gateErr, setGateErr] = useState('');
@@ -368,9 +371,25 @@ export default function App() {
     setTimeout(() => setToastMsg((prev) => (prev === msg ? '' : prev)), 3200);
   }, []);
 
-  // Streaming control
+  // Streaming & Project Status Light control
   const [isStreaming, setIsStreaming] = useState(false);
+  const [writePhase, setWritePhase] = useState<ProjectWritePhase>('idle');
+  const [activeStreamModel, setActiveStreamModel] = useState<string>('');
+  const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
+  const [autoContinue, setAutoContinue] = useState<boolean>(() => loadLocalJson<boolean>(LS_AUTO_CONTINUE, true));
   const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    saveLocalJson(LS_AUTO_CONTINUE, autoContinue);
+  }, [autoContinue]);
+
+  useEffect(() => {
+    if (!isStreaming) {
+      setWritePhase('idle');
+      setActiveStreamModel('');
+      setStreamStartedAt(null);
+    }
+  }, [activeId, isStreaming]);
 
   const refreshConnectors = useCallback(async () => {
     if (!isAdmin) {
@@ -671,6 +690,7 @@ export default function App() {
     if (!activeConv) return;
     if (isStreaming) {
       abortRef.current?.abort();
+      return;
     }
     setConversations((prev) =>
       prev.map((c) =>
@@ -696,17 +716,48 @@ export default function App() {
     );
   };
 
+  const buildSystemPrompt = (conv: Conversation): string => {
+    let systemPrompt = SYSTEM_PROMPTS[conv.mode];
+    if (conv.repoFullName) {
+      systemPrompt += `\n当前关联仓库: ${conv.repoFullName}，分支: ${conv.repoBranch || 'main'}`;
+    }
+    if (conv.attachedFilePath && conv.attachedFileContent) {
+      systemPrompt += `\n附带文件 (${conv.attachedFilePath}):\n\`\`\`\n${conv.attachedFileContent.slice(0, 18000)}\n\`\`\``;
+    }
+    return systemPrompt;
+  };
+
   const executeStream = async (
     convId: string,
     promptMessages: Array<{ role: string; content: string; attachments?: ChatAttachment[] }>,
     assistantMsgId: string,
     modelId: string,
-    providerId: string
+    providerId: string,
+    options?: {
+      continuationDepth?: number;
+      existingContent?: string;
+      systemPrompt?: string;
+      historyBeforeAssistant?: Array<{ role: string; content: string; attachments?: ChatAttachment[] }>;
+    }
   ) => {
     const provider = providers.find((p) => p.id === providerId);
     const ac = new AbortController();
     abortRef.current = ac;
+
+    const continuationDepth = options?.continuationDepth ?? 0;
+    let accumulated = options?.existingContent ?? '';
+    const wasInsideUnclosedFence = continuationDepth > 0 && hasUnclosedCodeFence(accumulated);
+    let checkedContinuationFence = false;
+    let willAutoContinue = false;
+
     setIsStreaming(true);
+    if (continuationDepth === 0) {
+      setStreamStartedAt(Date.now());
+      setActiveStreamModel(modelId);
+      setWritePhase('connecting');
+    } else {
+      setWritePhase('continuing');
+    }
 
     await streamChatCompletion({
       modelId,
@@ -715,7 +766,44 @@ export default function App() {
       temperature: settings.temperature,
       signal: ac.signal,
       callbacks: {
+        onMeta: (meta) => {
+          if (meta.model) {
+            setActiveStreamModel(meta.model);
+          }
+          if (meta.phase === 'fallback') {
+            setWritePhase('fallback');
+            if (meta.model && meta.fromModel) {
+              showToast(`${meta.fromModel} 响应超时，已自动切换至 ${meta.model}`);
+            }
+          } else if (meta.phase === 'connecting' || meta.phase === 'thinking') {
+            setWritePhase(continuationDepth > 0 ? 'continuing' : meta.phase);
+          } else if (meta.phase === 'writing') {
+            setWritePhase(continuationDepth > 0 ? 'continuing' : 'writing');
+          } else if (meta.phase === 'truncated') {
+            setWritePhase('truncated');
+          }
+        },
         onChunk: (delta) => {
+          let cleanDelta = delta;
+          if (wasInsideUnclosedFence && !checkedContinuationFence) {
+            checkedContinuationFence = true;
+            // Strip redundant opening code fence if continuation model re-opened a fence mid-block
+            const stripped = cleanDelta.replace(/^\s*```[^\n]*\n/, '');
+            if (stripped !== cleanDelta) {
+              cleanDelta = stripped;
+            } else if (accumulated && !accumulated.endsWith('\n') && !cleanDelta.startsWith('\n')) {
+              cleanDelta = '\n' + cleanDelta;
+            }
+          } else if (continuationDepth > 0 && !checkedContinuationFence) {
+            checkedContinuationFence = true;
+            if (accumulated && !accumulated.endsWith('\n') && !cleanDelta.startsWith('\n')) {
+              cleanDelta = '\n' + cleanDelta;
+            }
+          }
+
+          accumulated += cleanDelta;
+          setWritePhase((prev) => (prev === 'continuing' ? 'continuing' : 'writing'));
+
           setConversations((prev) =>
             prev.map((c) => {
               if (c.id !== convId) return c;
@@ -723,34 +811,85 @@ export default function App() {
                 ...c,
                 updatedAt: new Date().toISOString(),
                 messages: c.messages.map((m) =>
-                  m.id === assistantMsgId ? { ...m, content: m.content + delta } : m
+                  m.id === assistantMsgId ? { ...m, content: accumulated } : m
                 ),
               };
             })
           );
         },
-        onDone: () => {
+        onDone: async (result) => {
+          const needsContinuation =
+            Boolean(result.truncated || result.interrupted || hasUnclosedCodeFence(accumulated)) &&
+            accumulated.trim().length > 0 &&
+            !ac.signal.aborted;
+
+          if (needsContinuation && autoContinue && continuationDepth < 2 && options?.historyBeforeAssistant) {
+            willAutoContinue = true;
+            setWritePhase('continuing');
+            const nextMessages = [
+              { role: 'system', content: options.systemPrompt || SYSTEM_PROMPTS.code },
+              ...options.historyBeforeAssistant,
+              { role: 'assistant', content: accumulated },
+              {
+                role: 'user',
+                content:
+                  '请紧接着上面未完成的位置继续输出，不要重复已生成的开头内容，直接衔接正文或补全未闭合代码块，并确保全部代码完整收尾。',
+              },
+            ];
+            await executeStream(
+              convId,
+              nextMessages,
+              assistantMsgId,
+              result.activeModel || modelId,
+              providerId,
+              {
+                continuationDepth: continuationDepth + 1,
+                existingContent: accumulated,
+                systemPrompt: options.systemPrompt,
+                historyBeforeAssistant: options.historyBeforeAssistant,
+              }
+            );
+            return;
+          }
+
           setIsStreaming(false);
           abortRef.current = null;
+          const stillIncomplete = Boolean(result.truncated || result.interrupted || hasUnclosedCodeFence(accumulated));
+          setWritePhase(stillIncomplete ? 'truncated' : 'done');
+
           setConversations((prev) =>
             prev.map((c) => {
               if (c.id !== convId) return c;
               return {
                 ...c,
                 updatedAt: new Date().toISOString(),
-                messages: c.messages.map((m) =>
-                  m.id === assistantMsgId && !m.content
-                    ? { ...m, content: '（模型未返回内容，请检查模型连接状态灯或切换模型重试）' }
-                    : m
-                ),
+                messages: c.messages.map((m) => {
+                  if (m.id !== assistantMsgId) return m;
+                  if (!accumulated) {
+                    return {
+                      ...m,
+                      interrupted: true,
+                      content: '（模型未返回内容，请检查模型连接状态灯或切换模型重试）',
+                    };
+                  }
+                  return {
+                    ...m,
+                    modelId: result.activeModel || m.modelId,
+                    truncated: result.truncated || hasUnclosedCodeFence(accumulated),
+                    interrupted: result.interrupted,
+                    finishReason: result.finishReason,
+                  };
+                }),
               };
             })
           );
         },
         onError: (err) => {
+          if (willAutoContinue) return;
           setIsStreaming(false);
           abortRef.current = null;
           const isAbort = err.name === 'AbortError';
+          setWritePhase(isAbort ? 'paused' : 'error');
           setConversations((prev) =>
             prev.map((c) => {
               if (c.id !== convId) return c;
@@ -763,12 +902,13 @@ export default function App() {
                     return {
                       ...m,
                       paused: true,
-                      content: m.content || '（已暂停生成）',
+                      content: accumulated || '（已暂停生成）',
                     };
                   }
                   return {
                     ...m,
-                    content: `${m.content ? m.content + '\n\n' : ''}⚠️ ${err.message}`,
+                    interrupted: true,
+                    content: `${accumulated ? accumulated + '\n\n' : ''}⚠️ ${err.message}`,
                   };
                 }),
               };
@@ -817,29 +957,26 @@ export default function App() {
       )
     );
 
-    let systemPrompt = SYSTEM_PROMPTS[activeConv.mode];
-    if (activeConv.repoFullName) {
-      systemPrompt += `\n当前关联仓库: ${activeConv.repoFullName}，分支: ${activeConv.repoBranch || 'main'}`;
-    }
-    if (activeConv.attachedFilePath && activeConv.attachedFileContent) {
-      systemPrompt += `\n附带文件 (${activeConv.attachedFilePath}):\n\`\`\`\n${activeConv.attachedFileContent.slice(0, 18000)}\n\`\`\``;
-    }
-
-    const payloadMessages = [
-      { role: 'system', content: systemPrompt },
-      ...nextMessages.map((m) => ({
-        role: m.role,
-        content: m.content,
-        attachments: m.attachments,
-      })),
-    ];
+    const systemPrompt = buildSystemPrompt(activeConv);
+    const historyBeforeAssistant = nextMessages.map((m) => ({
+      role: m.role,
+      content: m.content,
+      attachments: m.attachments,
+    }));
+    const payloadMessages = [{ role: 'system', content: systemPrompt }, ...historyBeforeAssistant];
 
     await executeStream(
       activeConv.id,
       payloadMessages,
       assistantMsg.id,
       activeConv.modelId,
-      activeConv.providerId
+      activeConv.providerId,
+      {
+        continuationDepth: 0,
+        existingContent: '',
+        systemPrompt,
+        historyBeforeAssistant,
+      }
     );
   };
 
@@ -848,27 +985,41 @@ export default function App() {
     const last = activeConv.messages[activeConv.messages.length - 1];
     if (!last || last.role !== 'assistant') return;
 
+    const cleanContent = last.content
+      .replace(/^（已暂停生成）$/, '')
+      .replace(/\n\n⚠️ [^\n]*$/, '')
+      .trimEnd();
+
     const assistantMsgId = last.id;
     setConversations((prev) =>
       prev.map((c) =>
         c.id === activeConv.id
           ? {
               ...c,
-              messages: c.messages.map((m) => (m.id === assistantMsgId ? { ...m, paused: false } : m)),
+              messages: c.messages.map((m) =>
+                m.id === assistantMsgId
+                  ? { ...m, content: cleanContent, paused: false, truncated: false, interrupted: false }
+                  : m
+              ),
             }
           : c
       )
     );
 
+    const systemPrompt = buildSystemPrompt(activeConv);
+    const historyBeforeAssistant = activeConv.messages.slice(0, -1).map((m) => ({
+      role: m.role,
+      content: m.content,
+      attachments: m.attachments,
+    }));
     const payloadMessages = [
-      { role: 'system', content: SYSTEM_PROMPTS[activeConv.mode] },
-      ...activeConv.messages.slice(0, -1).map((m) => ({
-        role: m.role,
-        content: m.content,
-        attachments: m.attachments,
-      })),
-      { role: 'assistant', content: last.content },
-      { role: 'user', content: '请紧接着上一条未完成的内容继续输出，不要重复已生成部分。' },
+      { role: 'system', content: systemPrompt },
+      ...historyBeforeAssistant,
+      { role: 'assistant', content: cleanContent },
+      {
+        role: 'user',
+        content: '请紧接着上一条未完成的内容继续输出，不要重复已生成部分，直接补全剩余代码或说明。',
+      },
     ];
 
     await executeStream(
@@ -876,7 +1027,13 @@ export default function App() {
       payloadMessages,
       assistantMsgId,
       activeConv.modelId,
-      activeConv.providerId
+      activeConv.providerId,
+      {
+        continuationDepth: 0,
+        existingContent: cleanContent,
+        systemPrompt,
+        historyBeforeAssistant,
+      }
     );
   };
 
@@ -965,24 +1122,25 @@ export default function App() {
     }
   };
 
-  const handleSaveCodeToDb = async (code: string, lang: string) => {
+  const handleSaveCodeToDb = async (code: string, lang: string, filename?: string) => {
     if (!isAdmin) return;
-    const ext = lang || 'txt';
+    const ext = LANG_EXT_MAP[(lang || '').toLowerCase()] || lang || 'txt';
+    const baseName = filename ? filename.split('/').pop() || filename : `snippet-${Date.now()}.${ext}`;
     const res = await fetch('/api/db/items', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         id: uid(),
         type: 'file',
-        name: `snippet-${Date.now()}.${ext}`,
+        name: baseName,
         mimeType: 'text/plain',
         modelId: activeConv?.modelId,
         contentData: code,
-        repoPath: activeConv?.attachedFilePath || '',
+        repoPath: filename || activeConv?.attachedFilePath || '',
       }),
     });
     if (res.ok) {
-      showToast('代码文件已保存到数据库');
+      showToast(`代码文件 ${baseName} 已保存到数据库`);
       refreshStorageStatuses();
     } else {
       showToast('保存代码文件失败');
@@ -1837,6 +1995,11 @@ export default function App() {
                 activeModel={activeModel}
                 providerStatus={providerStatuses[activeConv.providerId]}
                 isStreaming={isStreaming}
+                writePhase={writePhase}
+                activeStreamModel={activeStreamModel}
+                streamStartedAt={streamStartedAt}
+                autoContinue={autoContinue}
+                onToggleAutoContinue={() => setAutoContinue((v) => !v)}
                 isAdmin={isAdmin}
                 isMobileLayout={isMobileLayout}
                 connectors={connectors}
@@ -1854,8 +2017,8 @@ export default function App() {
                   )
                 }
                 onSaveCodeToDb={handleSaveCodeToDb}
-                onSendCodeToRepo={(code, lang) => {
-                  setPendingRepoCode({ code, lang });
+                onSendCodeToRepo={(code, lang, filename) => {
+                  setPendingRepoCode({ code, lang, filename });
                   setRepoSubView('browser');
                 }}
                 onSaveCodeToConnector={handleSaveCodeToConnector}
@@ -1875,6 +2038,11 @@ export default function App() {
                 activeModel={activeModel}
                 providerStatus={providerStatuses[activeConv.providerId]}
                 isStreaming={isStreaming}
+                writePhase={writePhase}
+                activeStreamModel={activeStreamModel}
+                streamStartedAt={streamStartedAt}
+                autoContinue={autoContinue}
+                onToggleAutoContinue={() => setAutoContinue((v) => !v)}
                 isAdmin={isAdmin}
                 isMobileLayout={isMobileLayout}
                 connectors={connectors}
@@ -1892,8 +2060,8 @@ export default function App() {
                   )
                 }
                 onSaveCodeToDb={handleSaveCodeToDb}
-                onSendCodeToRepo={(code, lang) => {
-                  setPendingRepoCode({ code, lang });
+                onSendCodeToRepo={(code, lang, filename) => {
+                  setPendingRepoCode({ code, lang, filename });
                   setMode('repo');
                   setRepoSubView('browser');
                 }}

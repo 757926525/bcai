@@ -1,49 +1,14 @@
 import React, { useState } from 'react';
-import { Check, Copy, Database, Download, GitBranch, Plug } from 'lucide-react';
+import { Check, Copy, Database, Download, Eye, FileCode2, GitBranch, Plug, X } from 'lucide-react';
+import { LANG_EXT_MAP, parseMarkdownSegments } from '../utils/codeBlocks';
 
 interface MarkdownRendererProps {
   content: string;
-  onSaveCodeToDb?: (code: string, lang: string) => void;
-  onSendCodeToRepo?: (code: string, lang: string) => void;
-  onSaveCodeToConnector?: (code: string, lang: string) => void;
+  isStreamingMessage?: boolean;
+  onSaveCodeToDb?: (code: string, lang: string, filename?: string) => void;
+  onSendCodeToRepo?: (code: string, lang: string, filename?: string) => void;
+  onSaveCodeToConnector?: (code: string, lang: string, filename?: string) => void;
   repoConnected?: boolean;
-}
-
-type Segment =
-  | { type: 'text'; text: string }
-  | { type: 'code'; lang: string; code: string }
-  | { type: 'think'; text: string };
-
-function parseSegments(src: string): Segment[] {
-  const segments: Segment[] = [];
-  // Split <think>...</think> and ```lang\n...\n```
-  const pattern = /(<think>[\s\S]*?(?:<\/think>|$)|```[\w+#.-]*[^\S\n]*\n?[\s\S]*?(?:```|$))/g;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = pattern.exec(src)) !== null) {
-    if (match.index > lastIndex) {
-      segments.push({ type: 'text', text: src.slice(lastIndex, match.index) });
-    }
-    const token = match[0];
-    if (token.startsWith('<think>')) {
-      const inner = token.replace(/^<think>/, '').replace(/<\/think>$/, '').trim();
-      segments.push({ type: 'think', text: inner });
-    } else {
-      const m = token.match(/^```([\w+#.-]*)[^\S\n]*\n?([\s\S]*?)(?:```)?$/);
-      segments.push({
-        type: 'code',
-        lang: (m?.[1] || 'text').trim(),
-        code: (m?.[2] || '').replace(/\n$/, ''),
-      });
-    }
-    lastIndex = pattern.lastIndex;
-  }
-
-  if (lastIndex < src.length) {
-    segments.push({ type: 'text', text: src.slice(lastIndex) });
-  }
-  return segments;
 }
 
 function renderInline(line: string): React.ReactNode[] {
@@ -101,13 +66,31 @@ function renderInline(line: string): React.ReactNode[] {
 
 const CodeBlock: React.FC<{
   lang: string;
+  filename?: string;
   code: string;
-  onSaveCodeToDb?: (code: string, lang: string) => void;
-  onSendCodeToRepo?: (code: string, lang: string) => void;
-  onSaveCodeToConnector?: (code: string, lang: string) => void;
+  closed: boolean;
+  isStreamingMessage?: boolean;
+  onSaveCodeToDb?: (code: string, lang: string, filename?: string) => void;
+  onSendCodeToRepo?: (code: string, lang: string, filename?: string) => void;
+  onSaveCodeToConnector?: (code: string, lang: string, filename?: string) => void;
+  onPreviewHtml?: (code: string, title?: string) => void;
   repoConnected?: boolean;
-}> = ({ lang, code, onSaveCodeToDb, onSendCodeToRepo, onSaveCodeToConnector, repoConnected }) => {
+}> = ({
+  lang,
+  filename,
+  code,
+  closed,
+  isStreamingMessage,
+  onSaveCodeToDb,
+  onSendCodeToRepo,
+  onSaveCodeToConnector,
+  onPreviewHtml,
+  repoConnected,
+}) => {
   const [copied, setCopied] = useState(false);
+
+  const lineCount = code ? code.split('\n').length : 0;
+  const isHtml = lang.toLowerCase() === 'html' || lang.toLowerCase() === 'htm' || Boolean(filename?.endsWith('.html'));
 
   const handleCopy = () => {
     navigator.clipboard?.writeText(code).then(() => {
@@ -117,18 +100,13 @@ const CodeBlock: React.FC<{
   };
 
   const handleDownloadSnippet = () => {
-    const extMap: Record<string, string> = {
-      typescript: 'ts', ts: 'ts', tsx: 'tsx', javascript: 'js', js: 'js', jsx: 'jsx',
-      python: 'py', py: 'py', json: 'json', html: 'html', css: 'css', sql: 'sql',
-      bash: 'sh', sh: 'sh', markdown: 'md', md: 'md', yaml: 'yml', yml: 'yml',
-      toml: 'toml', rust: 'rs', go: 'go', java: 'java', cpp: 'cpp', c: 'c',
-    };
-    const ext = extMap[(lang || '').toLowerCase()] || 'txt';
+    const ext = LANG_EXT_MAP[(lang || '').toLowerCase()] || 'txt';
+    const downloadName = filename ? filename.split('/').pop() || `bcai-code.${ext}` : `bcai-code.${ext}`;
     const blob = new Blob([code], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `bcai-code.${ext}`;
+    a.download = downloadName;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
@@ -136,12 +114,52 @@ const CodeBlock: React.FC<{
   return (
     <div className="my-3 border border-slate-200 dark:border-slate-800 rounded-lg overflow-hidden bg-slate-50 dark:bg-slate-900/90">
       <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 border-b border-slate-200 dark:border-slate-800 bg-slate-100/80 dark:bg-slate-900 text-xs text-slate-600 dark:text-slate-400">
-        <span className="font-mono">{lang || 'text'}</span>
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
+          <span
+            className={`w-2 h-2 rounded-full shrink-0 ${
+              closed
+                ? 'bg-emerald-500'
+                : isStreamingMessage
+                ? 'bg-amber-500 animate-pulse'
+                : 'bg-red-500'
+            }`}
+            title={closed ? '代码块完整已闭合' : isStreamingMessage ? '正在流式写入代码…' : '代码块未闭合，可点续写补全'}
+          />
+          {filename ? (
+            <span className="inline-flex items-center gap-1 font-mono text-slate-800 dark:text-slate-200 font-medium truncate max-w-[200px]">
+              <FileCode2 className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
+              <span className="truncate">{filename}</span>
+            </span>
+          ) : (
+            <span className="font-mono">{lang || 'text'}</span>
+          )}
+          <span className="text-[11px] opacity-70 tabular-nums">
+            {filename ? `${lang || 'text'} · ` : ''}
+            {lineCount} 行
+          </span>
+          {!closed && (
+            <span className="text-[11px] text-amber-600 dark:text-amber-400 font-medium">
+              {isStreamingMessage ? '编写中…' : '未闭合'}
+            </span>
+          )}
+        </div>
+
         <div className="flex flex-wrap items-center justify-end gap-1">
+          {isHtml && onPreviewHtml && (
+            <button
+              type="button"
+              onClick={() => onPreviewHtml(code, filename || 'HTML 实时预览')}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded bg-blue-600/10 hover:bg-blue-600/20 text-blue-700 dark:text-blue-300 font-medium transition-colors whitespace-nowrap shrink-0"
+              title="在安全沙盒中实时运行预览 HTML"
+            >
+              <Eye className="w-3.5 h-3.5" />
+              <span>运行预览</span>
+            </button>
+          )}
           {onSaveCodeToDb && (
             <button
               type="button"
-              onClick={() => onSaveCodeToDb(code, lang)}
+              onClick={() => onSaveCodeToDb(code, lang, filename)}
               className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-slate-200/70 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition-colors whitespace-nowrap shrink-0"
               title="保存代码片段到数据库"
             >
@@ -152,7 +170,7 @@ const CodeBlock: React.FC<{
           {onSendCodeToRepo && repoConnected && (
             <button
               type="button"
-              onClick={() => onSendCodeToRepo(code, lang)}
+              onClick={() => onSendCodeToRepo(code, lang, filename)}
               className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-slate-200/70 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition-colors whitespace-nowrap shrink-0"
               title="发送到仓库编辑区以提交推送"
             >
@@ -163,7 +181,7 @@ const CodeBlock: React.FC<{
           {onSaveCodeToConnector && (
             <button
               type="button"
-              onClick={() => onSaveCodeToConnector(code, lang)}
+              onClick={() => onSaveCodeToConnector(code, lang, filename)}
               className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-slate-200/70 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition-colors whitespace-nowrap shrink-0"
               title="将代码保存到已连接的连接器（网盘/邮箱/Webhook）"
             >
@@ -199,88 +217,138 @@ const CodeBlock: React.FC<{
 
 export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
   content,
+  isStreamingMessage,
   onSaveCodeToDb,
   onSendCodeToRepo,
   onSaveCodeToConnector,
   repoConnected,
 }) => {
+  const [previewHtml, setPreviewHtml] = useState<{ code: string; title: string } | null>(null);
+
   if (!content) {
-    return <span className="text-slate-400 dark:text-slate-500">正在思考生成中…</span>;
+    return (
+      <span className="inline-flex items-center gap-2 text-slate-400 dark:text-slate-500 text-sm">
+        <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+        <span>正在连接模型并思考构思中…</span>
+      </span>
+    );
   }
 
-  const segments = parseSegments(content);
+  const segments = parseMarkdownSegments(content);
 
   return (
-    <div className="space-y-2 text-[15px] leading-relaxed text-slate-800 dark:text-slate-200">
-      {segments.map((seg, idx) => {
-        if (seg.type === 'think') {
-          return (
-            <details
-              key={idx}
-              className="my-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 px-3 py-2 text-sm text-slate-600 dark:text-slate-400"
-            >
-              <summary className="cursor-pointer font-medium select-none">思考过程</summary>
-              <div className="mt-2 whitespace-pre-wrap leading-relaxed">{seg.text}</div>
-            </details>
-          );
-        }
+    <>
+      <div className="space-y-2 text-[15px] leading-relaxed text-slate-800 dark:text-slate-200">
+        {segments.map((seg, idx) => {
+          if (seg.type === 'think') {
+            return (
+              <details
+                key={idx}
+                open={isStreamingMessage && !seg.closed}
+                className="my-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 px-3 py-2 text-sm text-slate-600 dark:text-slate-400"
+              >
+                <summary className="cursor-pointer font-medium select-none inline-flex items-center gap-2">
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      seg.closed ? 'bg-emerald-500' : 'bg-blue-500 animate-pulse'
+                    }`}
+                  />
+                  <span>{seg.closed ? '思考过程（已完成）' : '正在深度思考中…'}</span>
+                </summary>
+                <div className="mt-2 whitespace-pre-wrap leading-relaxed">{seg.text}</div>
+              </details>
+            );
+          }
 
-        if (seg.type === 'code') {
+          if (seg.type === 'code') {
+            return (
+              <CodeBlock
+                key={idx}
+                lang={seg.lang}
+                filename={seg.filename}
+                code={seg.code}
+                closed={seg.closed}
+                isStreamingMessage={isStreamingMessage}
+                onSaveCodeToDb={onSaveCodeToDb}
+                onSendCodeToRepo={onSendCodeToRepo}
+                onSaveCodeToConnector={onSaveCodeToConnector}
+                onPreviewHtml={(c, t) => setPreviewHtml({ code: c, title: t || 'HTML 实时预览' })}
+                repoConnected={repoConnected}
+              />
+            );
+          }
+
+          // Render structured text lines
+          const lines = seg.text.split('\n');
           return (
-            <CodeBlock
-              key={idx}
-              lang={seg.lang}
-              code={seg.code}
-              onSaveCodeToDb={onSaveCodeToDb}
-              onSendCodeToRepo={onSendCodeToRepo}
-              onSaveCodeToConnector={onSaveCodeToConnector}
-              repoConnected={repoConnected}
+            <div key={idx} className="space-y-1.5">
+              {lines.map((line, lIdx) => {
+                const trimmed = line.trim();
+                if (!trimmed) return <div key={lIdx} className="h-1" />;
+                const heading = trimmed.match(/^(#{1,4})\s+(.*)$/);
+                if (heading) {
+                  const level = heading[1].length;
+                  const cls =
+                    level <= 2
+                      ? 'text-base font-semibold text-slate-900 dark:text-slate-100 mt-3'
+                      : 'text-[15px] font-semibold text-slate-900 dark:text-slate-100 mt-2';
+                  return (
+                    <div key={lIdx} className={cls}>
+                      {renderInline(heading[2])}
+                    </div>
+                  );
+                }
+                if (/^[-*]\s+/.test(trimmed)) {
+                  return (
+                    <div key={lIdx} className="pl-4 flex gap-2">
+                      <span className="text-slate-400 select-none">•</span>
+                      <div className="flex-1">{renderInline(trimmed.replace(/^[-*]\s+/, ''))}</div>
+                    </div>
+                  );
+                }
+                if (/^\d+[.)]\s+/.test(trimmed)) {
+                  const numMatch = trimmed.match(/^(\d+[.)])\s+(.*)$/);
+                  return (
+                    <div key={lIdx} className="pl-4 flex gap-2">
+                      <span className="font-mono text-xs text-slate-500 pt-1 tabular-nums">{numMatch?.[1]}</span>
+                      <div className="flex-1">{renderInline(numMatch?.[2] || '')}</div>
+                    </div>
+                  );
+                }
+                return <p key={lIdx}>{renderInline(line)}</p>;
+              })}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Sandboxed HTML Live Preview Modal */}
+      {previewHtml && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-2 sm:p-4">
+          <div className="w-full max-w-4xl h-[82vh] flex flex-col rounded-xl border wb-border wb-panel shadow-2xl overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-2.5 border-b wb-border">
+              <div className="flex items-center gap-2 text-xs sm:text-sm font-semibold wb-ink">
+                <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                <span>{previewHtml.title}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPreviewHtml(null)}
+                className="w-8 h-8 rounded-lg flex items-center justify-center wb-muted hover:bg-black/5 dark:hover:bg-white/5"
+                aria-label="关闭预览"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <iframe
+              title={previewHtml.title}
+              srcDoc={previewHtml.code}
+              sandbox="allow-scripts"
+              className="flex-1 w-full bg-white border-0"
             />
-          );
-        }
-
-        // Render structured text lines
-        const lines = seg.text.split('\n');
-        return (
-          <div key={idx} className="space-y-1.5">
-            {lines.map((line, lIdx) => {
-              const trimmed = line.trim();
-              if (!trimmed) return <div key={lIdx} className="h-1" />;
-              const heading = trimmed.match(/^(#{1,4})\s+(.*)$/);
-              if (heading) {
-                const level = heading[1].length;
-                const cls =
-                  level <= 2
-                    ? 'text-base font-semibold text-slate-900 dark:text-slate-100 mt-3'
-                    : 'text-[15px] font-semibold text-slate-900 dark:text-slate-100 mt-2';
-                return (
-                  <div key={lIdx} className={cls}>
-                    {renderInline(heading[2])}
-                  </div>
-                );
-              }
-              if (/^[-*]\s+/.test(trimmed)) {
-                return (
-                  <div key={lIdx} className="pl-4 flex gap-2">
-                    <span className="text-slate-400 select-none">•</span>
-                    <div className="flex-1">{renderInline(trimmed.replace(/^[-*]\s+/, ''))}</div>
-                  </div>
-                );
-              }
-              if (/^\d+[.)]\s+/.test(trimmed)) {
-                const numMatch = trimmed.match(/^(\d+[.)])\s+(.*)$/);
-                return (
-                  <div key={lIdx} className="pl-4 flex gap-2">
-                    <span className="font-mono text-xs text-slate-500 pt-1 tabular-nums">{numMatch?.[1]}</span>
-                    <div className="flex-1">{renderInline(numMatch?.[2] || '')}</div>
-                  </div>
-                );
-              }
-              return <p key={lIdx}>{renderInline(line)}</p>;
-            })}
           </div>
-        );
-      })}
-    </div>
+        </div>
+      )}
+    </>
   );
 };

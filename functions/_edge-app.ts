@@ -739,19 +739,30 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
       const decoder = new TextDecoder();
       (async () => {
         let buf = '';
+        let finishReason: string | undefined;
+        let sentWriting = false;
         const emitLine = async (ln: string) => {
           if (!ln.startsWith('data:')) return;
           const raw = ln.slice(5).trim();
           if (!raw) return;
           try {
             const parsed = JSON.parse(raw);
-            const text = parsed?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-            if (text) await writer.write(encoder.encode(`data: ${JSON.stringify({ response: text })}\n\n`));
+            const candidate = parsed?.candidates?.[0];
+            if (candidate?.finishReason) finishReason = String(candidate.finishReason);
+            const text = candidate?.content?.parts?.[0]?.text || '';
+            if (text) {
+              if (!sentWriting) {
+                sentWriting = true;
+                await writer.write(encoder.encode(`data: ${JSON.stringify({ meta: { phase: 'writing', model: effectiveModel } })}\n\n`));
+              }
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ response: text })}\n\n`));
+            }
           } catch {
             // ignore
           }
         };
         try {
+          await writer.write(encoder.encode(`data: ${JSON.stringify({ meta: { phase: 'connecting', model: effectiveModel } })}\n\n`));
           while (true) {
             const { value, done } = await reader.read();
             if (done) break;
@@ -765,13 +776,18 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
           if (buf.trim()) {
             await emitLine(buf.trim());
           }
+          if (finishReason === 'MAX_TOKENS') {
+            await writer.write(encoder.encode(`data: ${JSON.stringify({ meta: { phase: 'truncated', finishReason, truncated: true, model: effectiveModel } })}\n\n`));
+          } else {
+            await writer.write(encoder.encode(`data: ${JSON.stringify({ meta: { phase: 'done', finishReason: finishReason || 'STOP', model: effectiveModel } })}\n\n`));
+          }
           await writer.write(encoder.encode('data: [DONE]\n\n'));
         } finally {
           await writer.close();
         }
       })();
       return new Response(transform.readable, {
-        headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache' },
+        headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform' },
       });
     }
 

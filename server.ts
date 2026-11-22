@@ -891,6 +891,42 @@ async function createServer() {
       if (!res.writableFinished) ac.abort();
     });
 
+    const initSseHeaders = () => {
+      if (res.headersSent) return;
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+    };
+
+    const writeSse = (payload: unknown) => {
+      if (ac.signal.aborted || res.writableEnded) return;
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    const startHeartbeat = () => {
+      if (heartbeatTimer) return;
+      heartbeatTimer = setInterval(() => {
+        if (ac.signal.aborted || res.writableEnded) {
+          if (heartbeatTimer) clearInterval(heartbeatTimer);
+          return;
+        }
+        res.write(': keepalive\n\n');
+      }, 7000);
+    };
+    const stopHeartbeat = () => {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    };
+
+    res.on('close', () => {
+      stopHeartbeat();
+    });
+
     try {
       // 1. Google Gemini via @google/genai SDK (supports multimodal images & files natively)
       if (providerType === 'gemini') {
@@ -919,7 +955,6 @@ async function createServer() {
           return cfg;
         };
 
-        let stream: AsyncIterable<any>;
         const openGeminiStream = async (targetModel: string, timeoutMs?: number) => {
           const cfg = buildGeminiConfig(targetModel);
           const run = () =>
@@ -939,11 +974,62 @@ async function createServer() {
           ]);
         };
 
+        initSseHeaders();
+        startHeartbeat();
+        writeSse({ meta: { phase: 'connecting', model: effectiveModel } });
+
+        const consumeGeminiStream = async (
+          targetModel: string,
+          firstChunkTimeoutMs?: number
+        ): Promise<{ receivedText: boolean; finishReason?: string }> => {
+          const activeStream = await openGeminiStream(targetModel, firstChunkTimeoutMs);
+          const iterator = activeStream[Symbol.asyncIterator]();
+          let receivedText = false;
+          let finishReason: string | undefined;
+
+          if (targetModel.startsWith('gemini-4')) {
+            writeSse({ meta: { phase: 'thinking', model: targetModel } });
+          }
+
+          while (!ac.signal.aborted) {
+            const nextPromise = iterator.next();
+            const step =
+              !receivedText && firstChunkTimeoutMs
+                ? await Promise.race([
+                    nextPromise,
+                    new Promise<never>((_, reject) =>
+                      setTimeout(
+                        () => reject(new Error('503 UNAVAILABLE: Gemini first chunk timeout')),
+                        firstChunkTimeoutMs
+                      )
+                    ),
+                  ])
+                : await nextPromise;
+
+            if (step.done) break;
+            const chunk = step.value;
+            const candidateFinish = chunk?.candidates?.[0]?.finishReason;
+            if (candidateFinish) finishReason = String(candidateFinish);
+            const text = chunk?.text || '';
+            if (text) {
+              if (!receivedText) {
+                writeSse({ meta: { phase: 'writing', model: targetModel } });
+              }
+              receivedText = true;
+              writeSse({ response: text });
+            }
+          }
+
+          return { receivedText, finishReason };
+        };
+
+        let finishReason: string | undefined;
         try {
-          stream = await openGeminiStream(
+          const result = await consumeGeminiStream(
             effectiveModel,
-            effectiveModel === 'gemini-4-hydrogen' ? 12000 : undefined
+            effectiveModel === 'gemini-4-hydrogen' ? 14000 : undefined
           );
+          finishReason = result.finishReason;
         } catch (geminiErr: any) {
           const msg = String(geminiErr?.message || '');
           const isOverloaded =
@@ -951,39 +1037,32 @@ async function createServer() {
             msg.includes('UNAVAILABLE') ||
             msg.includes('high demand') ||
             msg.includes('timeout');
-          if (effectiveModel === 'gemini-4-hydrogen' && isOverloaded) {
+          if (effectiveModel === 'gemini-4-hydrogen' && isOverloaded && !ac.signal.aborted) {
+            const fromModel = effectiveModel;
+            effectiveModel = 'gemini-3.1-flash-lite';
+            writeSse({ meta: { phase: 'fallback', fromModel, model: effectiveModel } });
             try {
-              effectiveModel = 'gemini-3.1-flash-lite';
-              stream = await openGeminiStream(effectiveModel);
+              const fallbackRes = await consumeGeminiStream(effectiveModel);
+              finishReason = fallbackRes.finishReason;
             } catch (fallbackErr: any) {
-              res.status(503).json({ error: formatFriendlyGeminiError(fallbackErr) });
-              return;
+              writeSse({ error: formatFriendlyGeminiError(fallbackErr) });
             }
-          } else {
-            res.status(503).json({ error: formatFriendlyGeminiError(geminiErr) });
-            return;
+          } else if (!ac.signal.aborted) {
+            writeSse({ error: formatFriendlyGeminiError(geminiErr) });
           }
+        } finally {
+          stopHeartbeat();
         }
 
-        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-
-        try {
-          for await (const chunk of stream) {
-            if (ac.signal.aborted) break;
-            const text = chunk.text || '';
-            if (text) {
-              res.write(`data: ${JSON.stringify({ response: text })}\n\n`);
-            }
-          }
-        } catch (streamErr: any) {
-          if (!ac.signal.aborted) {
-            res.write(`data: ${JSON.stringify({ response: `\n\n[流式中断提示: ${formatFriendlyGeminiError(streamErr)}]` })}\n\n`);
-          }
+        if (finishReason === 'MAX_TOKENS') {
+          writeSse({ meta: { phase: 'truncated', finishReason, truncated: true, model: effectiveModel } });
+        } else {
+          writeSse({ meta: { phase: 'done', finishReason: finishReason || 'STOP', model: effectiveModel } });
         }
-        res.write('data: [DONE]\n\n');
-        res.end();
+        if (!res.writableEnded) {
+          res.write('data: [DONE]\n\n');
+          res.end();
+        }
         return;
       }
 
@@ -1016,15 +1095,36 @@ async function createServer() {
           return;
         }
 
-        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache');
+        initSseHeaders();
+        startHeartbeat();
+        writeSse({ meta: { phase: 'writing', model } });
+
         const reader = upstream.body.getReader();
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          res.write(value);
+        const decoder = new TextDecoder();
+        let sawDone = false;
+        let tailBuf = '';
+        try {
+          while (!ac.signal.aborted) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (!res.writableEnded) {
+              res.write(value);
+            }
+            const chunkStr = tailBuf + decoder.decode(value, { stream: true });
+            const lines = chunkStr.split('\n');
+            tailBuf = lines.pop() || '';
+            for (const ln of lines) {
+              if (ln.includes('data: [DONE]')) sawDone = true;
+            }
+          }
+          if (tailBuf.includes('[DONE]')) sawDone = true;
+        } finally {
+          stopHeartbeat();
         }
-        res.end();
+        if (!sawDone && !ac.signal.aborted && !res.writableEnded) {
+          res.write('data: [DONE]\n\n');
+        }
+        if (!res.writableEnded) res.end();
         return;
       }
 
@@ -1071,16 +1171,38 @@ async function createServer() {
         return;
       }
 
-      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-cache');
+      initSseHeaders();
+      startHeartbeat();
+      writeSse({ meta: { phase: 'writing', model } });
+
       const reader = upstream.body.getReader();
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        res.write(value);
+      const decoder = new TextDecoder();
+      let sawDone = false;
+      let tailBuf = '';
+      try {
+        while (!ac.signal.aborted) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!res.writableEnded) {
+            res.write(value);
+          }
+          const chunkStr = tailBuf + decoder.decode(value, { stream: true });
+          const lines = chunkStr.split('\n');
+          tailBuf = lines.pop() || '';
+          for (const ln of lines) {
+            if (ln.includes('data: [DONE]')) sawDone = true;
+          }
+        }
+        if (tailBuf.includes('[DONE]')) sawDone = true;
+      } finally {
+        stopHeartbeat();
       }
-      res.end();
+      if (!sawDone && !ac.signal.aborted && !res.writableEnded) {
+        res.write('data: [DONE]\n\n');
+      }
+      if (!res.writableEnded) res.end();
     } catch (err: any) {
+      stopHeartbeat();
       if (err?.name === 'AbortError') {
         if (!res.writableEnded) res.end();
         return;
@@ -3184,9 +3306,13 @@ async function createServer() {
   }
 
   const port = Number(process.env.PORT) || 3000;
-  app.listen(port, '0.0.0.0', () => {
+  const server = app.listen(port, '0.0.0.0', () => {
     console.log(`BCAI server listening on http://0.0.0.0:${port}`);
   });
+  server.requestTimeout = 0;
+  server.timeout = 0;
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 125_000;
 }
 
 createServer();

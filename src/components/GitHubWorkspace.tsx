@@ -38,7 +38,7 @@ interface GitHubWorkspaceProps {
   onTokenConnect: (provider: GitProviderType, token: string, hostUrl: string) => Promise<void>;
   onDisconnect: (provider: GitProviderType) => Promise<void>;
   onStartRepoChat: (repo: string, branch: string, filePath?: string, fileContent?: string) => void;
-  pendingCodeToPush?: { code: string; lang: string } | null;
+  pendingCodeToPush?: { code: string; lang: string; filename?: string } | null;
   onClearPendingCode: () => void;
 }
 
@@ -125,14 +125,13 @@ export const GitHubWorkspace: React.FC<GitHubWorkspaceProps> = ({
   useEffect(() => {
     if (pendingCodeToPush) {
       setFileContent(pendingCodeToPush.code);
-      if (!activeFilePath) {
-        const ext = pendingCodeToPush.lang || 'ts';
-        setActiveFilePath(`src/generated-${Date.now()}.${ext}`);
-      }
+      setFileSha('');
+      const ext = pendingCodeToPush.lang || 'ts';
+      setActiveFilePath(pendingCodeToPush.filename || `src/generated-${Date.now()}.${ext}`);
       setStatusMsg('已载入 AI 生成的代码片段，请确认文件路径后点击“提交并推送到分支”。');
       onClearPendingCode();
     }
-  }, [pendingCodeToPush, activeFilePath, onClearPendingCode]);
+  }, [pendingCodeToPush, onClearPendingCode]);
 
   const isCurrentProviderOAuthReady = Boolean(
     (gitProvider === 'github' && (oauthConfigState?.github?.configured || oauthProviders?.github || oauthConfigured)) ||
