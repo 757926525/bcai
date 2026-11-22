@@ -3,10 +3,12 @@ import {
   BookOpen,
   ExternalLink,
   Laptop,
+  Lock,
   Moon,
   Palette,
   Plus,
   RefreshCw,
+  ShieldCheck,
   Smartphone,
   Sun,
   Trash2,
@@ -29,6 +31,8 @@ interface SettingsModalProps {
   initialTab?: 'providers' | 'guides' | 'appearance';
   onClose: () => void;
   isAdmin: boolean;
+  requireLoginGate: boolean;
+  onToggleLoginGate: (enabled: boolean) => Promise<void>;
   providers: ExternalProvider[];
   providerStatuses: Record<string, ProviderStatusInfo>;
   publicConfig: PublicConfig | null;
@@ -61,6 +65,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   initialTab = 'appearance',
   onClose,
   isAdmin,
+  requireLoginGate,
+  onToggleLoginGate,
   providers,
   providerStatuses,
   publicConfig,
@@ -79,6 +85,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onClearAllConversations,
 }) => {
   const [tab, setTab] = useState<'providers' | 'guides' | 'appearance'>(initialTab);
+  const [togglingGate, setTogglingGate] = useState(false);
 
   useEffect(() => {
     if (open) {
@@ -297,6 +304,57 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           ) : tab === 'providers' && isAdmin ? (
             <>
+              {/* Site-wide Admin Login Gate Toggle */}
+              <div className="rounded-xl border wb-border wb-bg p-4 flex flex-wrap items-center justify-between gap-3">
+                <div className="space-y-1 min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <ShieldCheck className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+                    <span className="text-sm font-semibold wb-ink">全站访问限制开关（管理员登录门禁）</span>
+                    <span
+                      className={`px-2 py-0.5 rounded-md text-[11px] font-medium ${
+                        requireLoginGate
+                          ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30'
+                          : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30'
+                      }`}
+                    >
+                      {requireLoginGate ? '已开启全站拦截' : '已关闭（免登录开放）'}
+                    </span>
+                  </div>
+                  <p className="text-xs wb-muted leading-relaxed">
+                    打开后，未登录的访客将被全屏管理员登录界面挡住主界面（同时后端拦截未授权对话、绘图与模型探测请求），仅管理员登录后方可使用全部功能。
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={requireLoginGate}
+                  disabled={togglingGate}
+                  onClick={async () => {
+                    setTogglingGate(true);
+                    try {
+                      await onToggleLoginGate(!requireLoginGate);
+                    } finally {
+                      setTogglingGate(false);
+                    }
+                  }}
+                  className={`h-9 px-3.5 rounded-lg border text-xs font-medium inline-flex items-center gap-2 transition-colors shrink-0 ${
+                    requireLoginGate
+                      ? 'bg-blue-600 border-blue-600 text-white hover:bg-blue-700'
+                      : 'wb-panel wb-border wb-ink hover:opacity-80'
+                  } disabled:opacity-50`}
+                >
+                  <Lock className="w-3.5 h-3.5" />
+                  <span>
+                    {togglingGate
+                      ? '切换中...'
+                      : requireLoginGate
+                      ? '已开启 · 点击关闭'
+                      : '已关闭 · 点击开启'}
+                  </span>
+                </button>
+              </div>
+
               {/* Header controls */}
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <p className="text-xs wb-muted">

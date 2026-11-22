@@ -15,7 +15,9 @@ import {
 import {
   BucketStatusInfo,
   Conversation,
+  DbProviderType,
   DbStatusInfo,
+  S3AddressingStyle,
   SavedAsset,
   SyncStatusInfo,
 } from '../types';
@@ -39,6 +41,29 @@ interface BucketObjectItem {
   lastModified: string;
 }
 
+const DB_PROVIDERS: Array<{ id: DbProviderType; label: string; badge: string; hint: string }> = [
+  { id: 'd1-http', label: 'Cloudflare D1', badge: '5GB 免费 · 自动建表', hint: '需要 Account ID、Database UUID 与含 D1:Edit 权限的 CF API Token。' },
+  { id: 'turso', label: 'Turso / libSQL', badge: '9GB 免费 · SQLite', hint: '填写 libsql://...turso.io 或 https://...turso.io 与 Auth Token，自动建表。' },
+  { id: 'supabase', label: 'Supabase Postgres', badge: '500MB 免费 · REST', hint: '填写 Project URL 与 service_role/anon Key（请先在 SQL Editor 运行 schema.sql）。' },
+  { id: 'neon', label: 'Neon Serverless PG', badge: '0.5GB 免费 · 自动建表', hint: '填写 Neon PostgreSQL 连接字符串，通过 HTTPS SQL API 自动建表。' },
+  { id: 'upstash', label: 'Upstash Redis REST', badge: '免费 KV · 零冷启动', hint: '填写 Upstash REST URL 与 REST Token，支持毫秒级读写。' },
+];
+
+const BUCKET_PRESETS: Array<{
+  id: string;
+  label: string;
+  endpointHint: string;
+  defaultRegion: string;
+  style: S3AddressingStyle;
+}> = [
+  { id: 'r2', label: 'Cloudflare R2', endpointHint: 'https://<ACCOUNT_ID>.r2.cloudflarestorage.com', defaultRegion: 'auto', style: 'path' },
+  { id: 'oss', label: '阿里云 OSS', endpointHint: 'https://oss-cn-hangzhou.aliyuncs.com', defaultRegion: 'cn-hangzhou', style: 'virtual' },
+  { id: 'cos', label: '腾讯云 COS', endpointHint: 'https://cos.ap-guangzhou.myqcloud.com', defaultRegion: 'ap-guangzhou', style: 'virtual' },
+  { id: 'aws', label: 'AWS S3', endpointHint: 'https://s3.us-east-1.amazonaws.com', defaultRegion: 'us-east-1', style: 'virtual' },
+  { id: 'minio', label: 'MinIO / 自建 S3', endpointHint: 'https://s3.yourdomain.com', defaultRegion: 'us-east-1', style: 'path' },
+  { id: 'b2', label: 'Backblaze B2 / 七牛 Kodo', endpointHint: 'https://s3.us-west-004.backblazeb2.com', defaultRegion: 'us-west-004', style: 'path' },
+];
+
 export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
   open,
   onClose,
@@ -55,22 +80,33 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
   const [filterType, setFilterType] = useState<'all' | 'image' | 'file'>('all');
   const [uploadTarget, setUploadTarget] = useState<'db' | 'bucket'>('db');
   const [loading, setLoading] = useState(false);
-  const [showD1Guide, setShowD1Guide] = useState(false);
+  const [showDbGuide, setShowDbGuide] = useState(false);
 
-  // D1 HTTP Config
+  // Multi-DB Config State
+  const [dbProvider, setDbProvider] = useState<DbProviderType>('d1-http');
   const [accountId, setAccountId] = useState('');
   const [databaseId, setDatabaseId] = useState('');
   const [apiToken, setApiToken] = useState('');
+  const [tursoUrl, setTursoUrl] = useState('');
+  const [tursoAuthToken, setTursoAuthToken] = useState('');
+  const [supabaseUrl, setSupabaseUrl] = useState('');
+  const [supabaseKey, setSupabaseKey] = useState('');
+  const [neonConnStr, setNeonConnStr] = useState('');
+  const [upstashUrl, setUpstashUrl] = useState('');
+  const [upstashToken, setUpstashToken] = useState('');
+
   const [bindingMsg, setBindingMsg] = useState('');
   const [bindingErr, setBindingErr] = useState('');
   const [savingBind, setSavingBind] = useState(false);
 
-  // Storage Bucket (R2/S3) Config
+  // Multi-Bucket (R2 / OSS / COS / S3 / MinIO) Config State
+  const [bucketPreset, setBucketPreset] = useState('r2');
   const [s3Endpoint, setS3Endpoint] = useState('');
   const [s3Region, setS3Region] = useState('auto');
   const [s3Bucket, setS3Bucket] = useState('');
   const [s3AccessKey, setS3AccessKey] = useState('');
   const [s3SecretKey, setS3SecretKey] = useState('');
+  const [s3Style, setS3Style] = useState<S3AddressingStyle>('path');
   const [bucketMsg, setBucketMsg] = useState('');
   const [bucketErr, setBucketErr] = useState('');
   const [savingBucket, setSavingBucket] = useState(false);
@@ -102,7 +138,15 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
 
   if (!open) return null;
 
-  const handleBindD1 = async (e: React.FormEvent) => {
+  const canSubmitDb = (() => {
+    if (dbProvider === 'd1-http') return Boolean(accountId.trim() && databaseId.trim() && apiToken.trim());
+    if (dbProvider === 'turso') return Boolean(tursoUrl.trim() && tursoAuthToken.trim());
+    if (dbProvider === 'supabase') return Boolean(supabaseUrl.trim() && supabaseKey.trim());
+    if (dbProvider === 'neon') return Boolean(neonConnStr.trim());
+    return Boolean(upstashUrl.trim() && upstashToken.trim());
+  })();
+
+  const handleBindDb = async (e: React.FormEvent) => {
     e.preventDefault();
     setSavingBind(true);
     setBindingMsg('');
@@ -111,12 +155,28 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
       const res = await fetch('/api/db/config', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ accountId, databaseId, apiToken }),
+        body: JSON.stringify({
+          provider: dbProvider,
+          accountId,
+          databaseId,
+          apiToken,
+          tursoUrl,
+          tursoAuthToken,
+          supabaseUrl,
+          supabaseKey,
+          neonConnectionString: neonConnStr,
+          upstashUrl,
+          upstashToken,
+        }),
       });
       const data = (await res.json()) as { message?: string; error?: string };
-      if (!res.ok) throw new Error(data.error || 'D1 绑定失败');
-      setBindingMsg(data.message || 'Cloudflare D1 绑定成功');
+      if (!res.ok) throw new Error(data.error || '数据库绑定失败');
+      setBindingMsg(data.message || '远程数据库绑定成功');
       setApiToken('');
+      setTursoAuthToken('');
+      setSupabaseKey('');
+      setNeonConnStr('');
+      setUpstashToken('');
       refresh();
     } catch (err: any) {
       setBindingErr(err?.message || '绑定失败');
@@ -125,14 +185,22 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
     }
   };
 
-  const handleUnbindD1 = async () => {
+  const handleUnbindDb = async () => {
     await fetch('/api/db/config', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ clear: true }),
     });
-    setBindingMsg('已解绑远程 D1，切回本地持久化');
+    setBindingMsg('已解绑远程数据库，切回本地持久化');
     refresh();
+  };
+
+  const applyBucketPreset = (presetId: string) => {
+    setBucketPreset(presetId);
+    const p = BUCKET_PRESETS.find((x) => x.id === presetId);
+    if (!p) return;
+    setS3Region(p.defaultRegion);
+    setS3Style(p.style);
   };
 
   const handleBindBucket = async (e: React.FormEvent) => {
@@ -150,6 +218,7 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
           bucket: s3Bucket,
           accessKeyId: s3AccessKey,
           secretAccessKey: s3SecretKey,
+          addressingStyle: s3Style,
         }),
       });
       const data = (await res.json()) as { message?: string; error?: string };
@@ -267,15 +336,22 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
       return (
         <span className="inline-flex items-center gap-1 text-xs font-medium text-sky-700 dark:text-sky-400 whitespace-nowrap">
           <HardDrive className="w-3 h-3" />
-          <span>存储桶 (R2/S3)</span>
+          <span>对象存储桶</span>
         </span>
       );
     }
-    if (loc === 'd1') {
+    if (loc && loc !== 'local') {
+      const map: Record<string, string> = {
+        d1: 'Cloudflare D1',
+        turso: 'Turso libSQL',
+        supabase: 'Supabase',
+        neon: 'Neon PG',
+        upstash: 'Upstash Redis',
+      };
       return (
         <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 dark:text-emerald-400 whitespace-nowrap">
           <Database className="w-3 h-3" />
-          <span>Cloudflare D1</span>
+          <span>{map[loc] || loc}</span>
         </span>
       );
     }
@@ -287,6 +363,9 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
     );
   };
 
+  const activeDbMeta = DB_PROVIDERS.find((d) => d.id === dbProvider) || DB_PROVIDERS[0];
+  const activeBucketPreset = BUCKET_PRESETS.find((b) => b.id === bucketPreset) || BUCKET_PRESETS[0];
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-2 sm:p-4">
       <div className="w-full max-w-5xl max-h-[94vh] flex flex-col rounded-xl border wb-border wb-panel shadow-xl overflow-hidden">
@@ -296,10 +375,10 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
             <Database className="w-5 h-5 wb-accent-text shrink-0" />
             <div className="min-w-0">
               <h2 className="text-base sm:text-lg font-semibold wb-ink truncate">
-                数据库存储（Cloudflare D1 优先）· 对象存储桶与文件时间记录
+                多数据库（D1 / Turso / Supabase / Neon / Upstash）· 多存储桶管理
               </h2>
               <p className="text-xs wb-muted truncate">
-                支持 D1 与 R2/S3 存储桶双通道存储，清晰标注文件存储位置，支持对话历史双向同步
+                支持 Cloudflare D1/R2、Turso、Supabase、Neon、Upstash 及阿里云 OSS / 腾讯云 COS / S3 / MinIO
               </p>
             </div>
           </div>
@@ -323,14 +402,10 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
               <span className="inline-flex items-center gap-1.5 text-xs font-medium whitespace-nowrap shrink-0">
                 <span
                   className={`w-2.5 h-2.5 rounded-full ${
-                    dbStatus.connected
-                      ? 'bg-emerald-600'
-                      : dbStatus.d1Bound
-                      ? 'bg-red-600'
-                      : 'bg-amber-500'
+                    dbStatus.connected ? 'bg-emerald-600' : dbStatus.d1Bound ? 'bg-red-600' : 'bg-amber-500'
                   }`}
                 />
-                <span>{dbStatus.connected ? 'D1 已连通' : dbStatus.d1Bound ? '异常' : '本地回退'}</span>
+                <span>{dbStatus.connected ? '已连通' : dbStatus.d1Bound ? '异常' : '本地回退'}</span>
               </span>
             </div>
 
@@ -342,11 +417,7 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
               <span className="inline-flex items-center gap-1.5 text-xs font-medium whitespace-nowrap shrink-0">
                 <span
                   className={`w-2.5 h-2.5 rounded-full ${
-                    bucketStatus.connected
-                      ? 'bg-emerald-600'
-                      : bucketStatus.configured
-                      ? 'bg-red-600'
-                      : 'bg-slate-400'
+                    bucketStatus.connected ? 'bg-emerald-600' : bucketStatus.configured ? 'bg-red-600' : 'bg-slate-400'
                   }`}
                 />
                 <span>{bucketStatus.connected ? '已连通' : bucketStatus.configured ? '异常' : '未连接'}</span>
@@ -389,7 +460,7 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
           <div className="rounded-xl border wb-border wb-bg p-3.5 flex flex-wrap items-center justify-between gap-3">
             <div className="text-xs wb-ink">
               <span className="font-semibold">对话历史同步 ({conversations.length} 个会话)</span>
-              <span className="wb-muted ml-2">可将全部对话同步到已绑定的 D1 数据库与对象存储桶，并支持跨设备恢复。</span>
+              <span className="wb-muted ml-2">支持双向同步到已绑定的远程数据库与对象存储桶。</span>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <button
@@ -399,7 +470,7 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
                 className="h-9 px-3.5 rounded-lg wb-accent text-xs font-medium inline-flex items-center gap-1.5 disabled:opacity-50"
               >
                 <CloudUpload className="w-3.5 h-3.5" />
-                <span>{syncStatus.status === 'syncing' ? '同步中...' : '立即同步历史到 D1/存储桶'}</span>
+                <span>{syncStatus.status === 'syncing' ? '同步中...' : '立即同步历史'}</span>
               </button>
               <button
                 type="button"
@@ -411,103 +482,109 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
             </div>
           </div>
 
-          {/* Cloudflare D1 Binding Form + Detailed HTTP API Guide */}
-          <form onSubmit={handleBindD1} className="rounded-xl border wb-border p-4 space-y-3 wb-bg">
+          {/* Multi-Database Selector & Config Form */}
+          <form onSubmit={handleBindDb} className="rounded-xl border wb-border p-4 space-y-3 wb-bg">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
-                <h3 className="text-sm font-semibold wb-ink">绑定 Cloudflare D1 数据库</h3>
-                <p className="text-xs wb-muted">
-                  部署到 Cloudflare Pages 时自动使用原生 <code className="font-mono">env.DB</code>；独立运行可在此绑定 D1 HTTP API（绑定时自动初始化 <code className="font-mono">media_assets</code> 与 <code className="font-mono">conversations</code> 表）。
-                </p>
+                <h3 className="text-sm font-semibold wb-ink">选择并绑定远程数据库</h3>
+                <p className="text-xs wb-muted">{activeDbMeta.hint}</p>
               </div>
               <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setShowD1Guide((v) => !v)}
+                  onClick={() => setShowDbGuide((v) => !v)}
                   className="h-8 px-3 rounded-lg border wb-border wb-panel text-xs font-medium wb-accent-text inline-flex items-center gap-1"
                 >
                   <BookOpen className="w-3.5 h-3.5" />
-                  <span>{showD1Guide ? '收起 D1 详细绑定指南' : '查看 D1 HTTP API 详细绑定指南'}</span>
+                  <span>{showDbGuide ? '收起接入说明' : '多数据库接入指南'}</span>
                 </button>
                 {dbStatus.d1Bound && (
                   <button
                     type="button"
-                    onClick={handleUnbindD1}
+                    onClick={handleUnbindDb}
                     className="h-8 px-3 rounded-lg border wb-border wb-panel text-xs wb-muted hover:wb-ink"
                   >
-                    解绑 D1
+                    解绑数据库
                   </button>
                 )}
               </div>
             </div>
 
-            {showD1Guide && (
-              <div className="rounded-lg border wb-border wb-panel p-3.5 text-xs space-y-2 leading-relaxed">
-                <div className="font-semibold wb-ink">独立运行绑定 Cloudflare D1 HTTP API 详细步骤指南：</div>
-                <ol className="list-decimal pl-5 space-y-1.5 wb-muted">
-                  <li>
-                    <strong className="wb-ink">获取 Account ID</strong>：登录 Cloudflare Dashboard 首页 → 点击右侧边栏或任意域名的「Overview」，即可复制 32 位 <code className="font-mono">Account ID</code>。
-                  </li>
-                  <li>
-                    <strong className="wb-ink">创建 D1 数据库并获取 Database UUID</strong>：左侧菜单进入「Workers &amp; Pages」→「D1 SQL Database」→ 点击「Create」创建库（例如 <code className="font-mono">bcai-db</code>），进入数据库详情页复制其 UUID（形如 <code className="font-mono">xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</code>）。
-                  </li>
-                  <li>
-                    <strong className="wb-ink">生成具备 D1 Edit 权限的 API Token</strong>：右上角头像 →「My Profile」→「API Tokens」→「Create Token」→ 选择自定义权限，添加 <code className="font-mono">Account · D1 · Edit</code>（若同时用 Workers AI，建议一并勾选 <code className="font-mono">Account · Workers AI · Edit</code>）。
-                  </li>
-                  <li>
-                    <strong className="wb-ink">自动初始化表结构</strong>：将以上 3 项填入下方输入框并点击「验证并绑定 Cloudflare D1」，系统会自动通过 HTTP API 执行 <code className="font-mono">CREATE TABLE IF NOT EXISTS media_assets ...</code> 与 <code className="font-mono">conversations</code> 建表，无需手动执行 CLI！
-                  </li>
-                  <li>
-                    <strong className="wb-ink">持久化提示</strong>：在 Vercel / Docker / VPS 环境也可以直接将 <code className="font-mono">CF_ACCOUNT_ID</code>、<code className="font-mono">CF_D1_DATABASE_ID</code>、<code className="font-mono">CF_API_TOKEN</code> 写入环境变量，重启后自动生效。
-                  </li>
-                </ol>
+            <div className="flex flex-wrap gap-1.5">
+              {DB_PROVIDERS.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => setDbProvider(p.id)}
+                  className={`px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors ${
+                    dbProvider === p.id ? 'border-blue-600 wb-tint wb-accent-text' : 'wb-border wb-panel wb-ink'
+                  }`}
+                >
+                  <span>{p.label}</span>
+                  <span className="ml-1.5 text-[10px] opacity-75">{p.badge}</span>
+                </button>
+              ))}
+            </div>
+
+            {showDbGuide && (
+              <div className="rounded-lg border wb-border wb-panel p-3.5 text-xs space-y-1.5 leading-relaxed wb-muted">
+                <div className="font-semibold wb-ink">多数据库配置要点：</div>
+                <p>• <strong className="wb-ink">Cloudflare D1</strong>：Pages 原生自动绑定 <code className="font-mono">env.DB</code>；独立服务器填写 Account ID + Database UUID + Token 自动建表。</p>
+                <p>• <strong className="wb-ink">Turso / Neon</strong>：填入数据库 URL/连接串与 Token 即可自动完成 <code className="font-mono">media_assets</code> 与 <code className="font-mono">conversations</code> 建表。</p>
+                <p>• <strong className="wb-ink">Supabase</strong>：先在 Supabase SQL Editor 执行仓库根目录 <code className="font-mono">schema.sql</code>，再填入 Project URL 与 Service Role Key。</p>
+                <p>• <strong className="wb-ink">Upstash Redis</strong>：纯 HTTPS REST 接口，适合边缘节点高频读写同步。</p>
               </div>
             )}
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
-              <input
-                type="text"
-                value={accountId}
-                onChange={(e) => setAccountId(e.target.value)}
-                placeholder="Cloudflare Account ID"
-                className="h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink"
-              />
-              <input
-                type="text"
-                value={databaseId}
-                onChange={(e) => setDatabaseId(e.target.value)}
-                placeholder="D1 Database UUID"
-                className="h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink"
-              />
-              <input
-                type="password"
-                value={apiToken}
-                onChange={(e) => setApiToken(e.target.value)}
-                placeholder="CF API Token (含 D1 Edit 权限)"
-                className="h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink"
-              />
-            </div>
+            {dbProvider === 'd1-http' && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
+                <input type="text" value={accountId} onChange={(e) => setAccountId(e.target.value)} placeholder="Cloudflare Account ID" className="h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink" />
+                <input type="text" value={databaseId} onChange={(e) => setDatabaseId(e.target.value)} placeholder="D1 Database UUID" className="h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink" />
+                <input type="password" value={apiToken} onChange={(e) => setApiToken(e.target.value)} placeholder="CF API Token (含 D1 Edit 权限)" className="h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink" />
+              </div>
+            )}
+            {dbProvider === 'turso' && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                <input type="text" value={tursoUrl} onChange={(e) => setTursoUrl(e.target.value)} placeholder="Turso URL (libsql://your-db.turso.io)" className="h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink" />
+                <input type="password" value={tursoAuthToken} onChange={(e) => setTursoAuthToken(e.target.value)} placeholder="Turso Auth Token" className="h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink" />
+              </div>
+            )}
+            {dbProvider === 'supabase' && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                <input type="text" value={supabaseUrl} onChange={(e) => setSupabaseUrl(e.target.value)} placeholder="Supabase Project URL (https://xxx.supabase.co)" className="h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink" />
+                <input type="password" value={supabaseKey} onChange={(e) => setSupabaseKey(e.target.value)} placeholder="Supabase Service Role / Anon Key" className="h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink" />
+              </div>
+            )}
+            {dbProvider === 'neon' && (
+              <input type="password" value={neonConnStr} onChange={(e) => setNeonConnStr(e.target.value)} placeholder="postgresql://user:pass@ep-xxx.neon.tech/neondb?sslmode=require" className="w-full h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink" />
+            )}
+            {dbProvider === 'upstash' && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                <input type="text" value={upstashUrl} onChange={(e) => setUpstashUrl(e.target.value)} placeholder="Upstash Redis REST URL (https://xxx.upstash.io)" className="h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink" />
+                <input type="password" value={upstashToken} onChange={(e) => setUpstashToken(e.target.value)} placeholder="Upstash REST Token" className="h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink" />
+              </div>
+            )}
 
             <div className="flex flex-wrap items-center justify-between gap-2">
               <button
                 type="submit"
-                disabled={savingBind || !accountId.trim() || !databaseId.trim() || !apiToken.trim()}
+                disabled={savingBind || !canSubmitDb}
                 className="h-9 px-4 rounded-lg wb-accent text-xs font-medium disabled:opacity-40"
               >
-                {savingBind ? '正在验证并自动建表...' : '验证并绑定 Cloudflare D1'}
+                {savingBind ? '正在验证并初始化...' : `验证并绑定 ${activeDbMeta.label}`}
               </button>
               {bindingMsg && <span className="text-xs text-emerald-600 dark:text-emerald-400">{bindingMsg}</span>}
               {bindingErr && <span className="text-xs text-red-600 dark:text-red-400">{bindingErr}</span>}
             </div>
           </form>
 
-          {/* Storage Bucket Binding Form (Cloudflare R2 / S3) */}
+          {/* Multi-Cloud Storage Bucket Binding Form */}
           <form onSubmit={handleBindBucket} className="rounded-xl border wb-border p-4 space-y-3 wb-bg">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
-                <h3 className="text-sm font-semibold wb-ink">绑定对象存储桶（Cloudflare R2 / S3 兼容）</h3>
+                <h3 className="text-sm font-semibold wb-ink">选择并绑定对象存储桶（R2 · 阿里云 OSS · 腾讯云 COS · AWS S3 · MinIO）</h3>
                 <p className="text-xs wb-muted">
-                  R2 Endpoint 示例：<code className="font-mono">https://&lt;ACCOUNT_ID&gt;.r2.cloudflarestorage.com</code>，Region 填 <code className="font-mono">auto</code>；支持图片、代码压缩包与会话历史云端同步。
+                  Endpoint 参考：<code className="font-mono">{activeBucketPreset.endpointHint}</code> · 默认签名模式：<code className="font-mono">{s3Style}</code>
                 </p>
               </div>
               {bucketStatus.configured && (
@@ -521,12 +598,27 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
               )}
             </div>
 
+            <div className="flex flex-wrap gap-1.5">
+              {BUCKET_PRESETS.map((b) => (
+                <button
+                  key={b.id}
+                  type="button"
+                  onClick={() => applyBucketPreset(b.id)}
+                  className={`px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors ${
+                    bucketPreset === b.id ? 'border-blue-600 wb-tint wb-accent-text' : 'wb-border wb-panel wb-ink'
+                  }`}
+                >
+                  {b.label}
+                </button>
+              ))}
+            </div>
+
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5">
               <input
                 type="text"
                 value={s3Endpoint}
                 onChange={(e) => setS3Endpoint(e.target.value)}
-                placeholder="Endpoint (https://...)"
+                placeholder={activeBucketPreset.endpointHint}
                 className="lg:col-span-2 h-10 px-3 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink"
               />
               <input
@@ -553,14 +645,23 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <input
                   type="text"
                   value={s3Region}
                   onChange={(e) => setS3Region(e.target.value)}
                   placeholder="Region (auto)"
-                  className="w-24 h-9 px-2.5 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink"
+                  className="w-28 h-9 px-2.5 rounded-lg border wb-border wb-panel text-xs font-mono wb-ink"
                 />
+                <select
+                  value={s3Style}
+                  onChange={(e) => setS3Style(e.target.value as S3AddressingStyle)}
+                  className="h-9 px-2.5 rounded-lg border wb-border wb-panel text-xs wb-ink"
+                  title="S3 URL 访问样式（OSS/COS 用 Virtual-Hosted，R2/MinIO 用 Path-Style）"
+                >
+                  <option value="path">Path-Style (R2 / MinIO / B2)</option>
+                  <option value="virtual">Virtual-Hosted (阿里云 OSS / 腾讯云 COS / AWS)</option>
+                </select>
                 <button
                   type="submit"
                   disabled={savingBucket || !s3Endpoint.trim() || !s3Bucket.trim() || !s3AccessKey.trim() || !s3SecretKey.trim()}
@@ -598,7 +699,7 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
                   onChange={(e) => setUploadTarget(e.target.value as 'db' | 'bucket')}
                   className="h-9 px-2.5 rounded-lg border wb-border wb-panel text-xs wb-ink"
                 >
-                  <option value="db">上传目标：D1 数据库</option>
+                  <option value="db">上传目标：数据库</option>
                   <option value="bucket" disabled={!bucketStatus.connected}>
                     上传目标：对象存储桶 {!bucketStatus.connected ? '(未连通)' : ''}
                   </option>
@@ -694,7 +795,6 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
                         </tr>
                       ))}
 
-                      {/* Direct Bucket Objects not indexed in DB table */}
                       {bucketItems
                         .filter((bo) => !items.some((i) => i.bucket_key === bo.key))
                         .map((bo) => (

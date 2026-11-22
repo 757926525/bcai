@@ -123,6 +123,10 @@ export interface GeneratedImageCard {
 
 export type StorageLocationType = 'd1' | 'bucket' | 'local';
 
+export type DbProviderType = 'd1-http' | 'turso' | 'supabase' | 'neon' | 'upstash';
+
+export type S3AddressingStyle = 'path' | 'virtual';
+
 export interface SavedAsset {
   id: string;
   type: 'image' | 'file';
@@ -145,6 +149,7 @@ export interface StorageBucketConfig {
   bucket: string;
   accessKeyId: string;
   secretAccessKey: string;
+  addressingStyle?: S3AddressingStyle;
   publicBaseUrl?: string;
 }
 
@@ -160,6 +165,7 @@ export interface BucketStatusInfo {
 
 export interface DbStatusInfo {
   mode: string;
+  provider?: string;
   connected: boolean;
   d1Bound: boolean;
   label: string;
@@ -178,6 +184,7 @@ export interface PublicConfig {
   isAdmin: boolean;
   hasAdminPassword: boolean;
   usingEnvPassword: boolean;
+  requireLoginGate?: boolean;
   defaultTargetRepoUrl: string;
   appUrl: string;
   envProviders: {
@@ -191,8 +198,21 @@ export interface PublicConfig {
     openaiModels: string[];
   };
   d1Bound: boolean;
+  dbProvider?: string;
   bucketBound: boolean;
   githubOAuthConfigured: boolean;
+  gitOAuthProviders?: {
+    github: boolean;
+    gitlab: boolean;
+    gitee: boolean;
+  };
+}
+
+export interface GitOAuthConfigSummary {
+  siteId?: string;
+  github: { clientId: string; configured: boolean };
+  gitlab: { clientId: string; hostUrl: string; configured: boolean };
+  gitee: { clientId: string; configured: boolean };
 }
 
 export type GitProviderType = 'github' | 'gitlab' | 'gitee';

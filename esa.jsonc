@@ -1,0 +1,12 @@
+{
+  "name": "bcai-workbench",
+  "buildCommand": "npm run build:pages",
+  "assets": {
+    "directory": "./dist-pages",
+    "notFoundStrategy": "singlePageApplication"
+  },
+  "routes": [
+    { "src": "/api/.*", "dest": "/_worker.js" },
+    { "src": "/auth/callback.*", "dest": "/_worker.js" }
+  ]
+}

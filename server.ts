@@ -13,6 +13,18 @@ import {
   s3PutObject,
   type S3Config,
 } from './functions/_crypto-s3.ts';
+import {
+  type ExternalDbConfig,
+  type ExternalDbProvider,
+  dbProviderLabel,
+  deleteExternalDbAsset,
+  deleteExternalDbAssetByBucketKey,
+  fetchExternalDbConversations,
+  listExternalDbAssets,
+  syncExternalDbConversations,
+  testAndInitExternalDb,
+  upsertExternalDbAsset,
+} from './functions/_db-adapters.ts';
 
 dotenv.config();
 
@@ -26,6 +38,7 @@ const BUCKET_CFG_FILE = path.join(DATA_DIR, 'bucket-config.json');
 const ADMIN_AUTH_FILE = path.join(DATA_DIR, 'admin-auth.json');
 const CONNECTORS_FILE = path.join(DATA_DIR, 'connectors.json');
 const GIT_CFG_FILE = path.join(DATA_DIR, 'git-tokens.json');
+const GIT_OAUTH_CFG_FILE = path.join(DATA_DIR, 'git-oauth-config.json');
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -66,7 +79,21 @@ interface AdminAuthStore {
   passwordHash?: string;
   salt?: string;
   sessionSecret: string;
+  requireLoginGate?: boolean;
   updatedAt?: string;
+}
+
+interface GitOAuthAppEntry {
+  clientId?: string;
+  clientSecret?: string;
+  hostUrl?: string;
+}
+
+interface GitOAuthConfigStore {
+  siteId?: string;
+  github?: GitOAuthAppEntry;
+  gitlab?: GitOAuthAppEntry;
+  gitee?: GitOAuthAppEntry;
 }
 
 interface ChatAttachmentInput {
@@ -202,17 +229,87 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   res.status(401).json({ error: '此操作仅限管理员，请先在右上角点击“管理员登录”。' });
 }
 
-function getD1Config(): D1BindingConfig | null {
+function setIframeCookie(res: Response, name: string, value: string, maxAgeMs = 14 * 24 * 60 * 60 * 1000): void {
+  const maxAgeSec = Math.floor(maxAgeMs / 1000);
+  res.append(
+    'Set-Cookie',
+    `${name}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAgeSec}; HttpOnly; Secure; SameSite=None; Partitioned`
+  );
+}
+
+function clearIframeCookie(res: Response, name: string): void {
+  res.append('Set-Cookie', `${name}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None; Partitioned`);
+}
+
+function assertSafeExternalUrl(rawUrl: string): URL {
+  const parsed = new URL(rawUrl.trim());
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('仅支持 http:// 或 https:// 协议地址');
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (
+    host === 'localhost' ||
+    host === '127.0.0.1' ||
+    host === '::1' ||
+    host === '0.0.0.0' ||
+    host.endsWith('.local') ||
+    host.startsWith('169.254.') ||
+    host.startsWith('10.') ||
+    host.startsWith('192.168.') ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+  ) {
+    throw new Error('安全策略拦截：禁止访问本地回环或内网地址');
+  }
+  return parsed;
+}
+
+function getDbConfig(): ExternalDbConfig | null {
   if (process.env.CF_ACCOUNT_ID && process.env.CF_D1_DATABASE_ID && process.env.CF_API_TOKEN) {
     return {
+      provider: 'd1-http',
       accountId: process.env.CF_ACCOUNT_ID,
       databaseId: process.env.CF_D1_DATABASE_ID,
       apiToken: process.env.CF_API_TOKEN,
     };
   }
-  const saved = readJsonFile<D1BindingConfig | null>(D1_CFG_FILE, null);
-  if (saved && saved.accountId && saved.databaseId && saved.apiToken) {
-    return saved;
+  if (process.env.TURSO_URL && process.env.TURSO_AUTH_TOKEN) {
+    return {
+      provider: 'turso',
+      tursoUrl: process.env.TURSO_URL,
+      tursoAuthToken: process.env.TURSO_AUTH_TOKEN,
+    };
+  }
+  if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
+    return {
+      provider: 'supabase',
+      supabaseUrl: process.env.SUPABASE_URL,
+      supabaseKey: process.env.SUPABASE_KEY,
+    };
+  }
+  if (process.env.NEON_CONNECTION_STRING) {
+    return {
+      provider: 'neon',
+      neonConnectionString: process.env.NEON_CONNECTION_STRING,
+    };
+  }
+  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return {
+      provider: 'upstash',
+      upstashUrl: process.env.UPSTASH_REDIS_REST_URL,
+      upstashToken: process.env.UPSTASH_REDIS_REST_TOKEN,
+    };
+  }
+  const saved = readJsonFile<any>(D1_CFG_FILE, null);
+  if (saved) {
+    if (saved.provider) return saved as ExternalDbConfig;
+    if (saved.accountId && saved.databaseId && saved.apiToken) {
+      return {
+        provider: 'd1-http',
+        accountId: saved.accountId,
+        databaseId: saved.databaseId,
+        apiToken: saved.apiToken,
+      };
+    }
   }
   return null;
 }
@@ -224,12 +321,14 @@ function getBucketConfig(): S3Config | null {
     process.env.S3_ACCESS_KEY_ID &&
     process.env.S3_SECRET_ACCESS_KEY
   ) {
+    const style = process.env.S3_ADDRESSING_STYLE === 'virtual' ? 'virtual' : process.env.S3_ADDRESSING_STYLE === 'path' ? 'path' : undefined;
     return {
       endpoint: process.env.S3_ENDPOINT,
       region: process.env.S3_REGION || 'auto',
       bucket: process.env.S3_BUCKET,
       accessKeyId: process.env.S3_ACCESS_KEY_ID,
       secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+      addressingStyle: style,
     };
   }
   const saved = readJsonFile<S3Config | null>(BUCKET_CFG_FILE, null);
@@ -239,81 +338,56 @@ function getBucketConfig(): S3Config | null {
   return null;
 }
 
-async function queryD1(cfg: D1BindingConfig, sql: string, params: unknown[] = []): Promise<any[]> {
-  const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(cfg.accountId)}/d1/database/${encodeURIComponent(cfg.databaseId)}/query`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${cfg.apiToken}`,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({ sql, params }),
-  });
-  const data = (await res.json()) as {
-    success?: boolean;
-    errors?: Array<{ message: string }>;
-    result?: Array<{ results?: any[]; success?: boolean }>;
-  };
-  if (!res.ok || !data.success) {
-    const errMsg = data?.errors?.[0]?.message || `D1 HTTP ${res.status}`;
-    throw new Error(errMsg);
+function getGitOAuthCredentials(provider: 'github' | 'gitlab' | 'gitee', hostUrlOverride?: string): {
+  clientId: string;
+  clientSecret: string;
+  hostUrl: string;
+} {
+  const saved = readJsonFile<GitOAuthConfigStore>(GIT_OAUTH_CFG_FILE, {});
+  if (provider === 'github') {
+    return {
+      clientId: (process.env.GITHUB_CLIENT_ID || saved.github?.clientId || '').trim(),
+      clientSecret: (process.env.GITHUB_CLIENT_SECRET || saved.github?.clientSecret || '').trim(),
+      hostUrl: 'https://github.com',
+    };
   }
-  return data.result?.[0]?.results || [];
+  if (provider === 'gitlab') {
+    return {
+      clientId: (process.env.GITLAB_CLIENT_ID || saved.gitlab?.clientId || '').trim(),
+      clientSecret: (process.env.GITLAB_CLIENT_SECRET || saved.gitlab?.clientSecret || '').trim(),
+      hostUrl: (hostUrlOverride || saved.gitlab?.hostUrl || 'https://gitlab.com').trim().replace(/\/+$/, ''),
+    };
+  }
+  return {
+    clientId: (process.env.GITEE_CLIENT_ID || saved.gitee?.clientId || '').trim(),
+    clientSecret: (process.env.GITEE_CLIENT_SECRET || saved.gitee?.clientSecret || '').trim(),
+    hostUrl: 'https://gitee.com',
+  };
 }
 
-async function ensureD1Tables(cfg: D1BindingConfig): Promise<void> {
-  await queryD1(
-    cfg,
-    `CREATE TABLE IF NOT EXISTS media_assets (
-      id TEXT PRIMARY KEY,
-      type TEXT NOT NULL,
-      name TEXT NOT NULL,
-      mime_type TEXT NOT NULL,
-      size_bytes INTEGER NOT NULL DEFAULT 0,
-      prompt TEXT,
-      model_id TEXT,
-      content_data TEXT NOT NULL,
-      repo_path TEXT,
-      storage_location TEXT NOT NULL DEFAULT 'd1',
-      bucket_key TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )`
-  );
-  // Safe column migration for existing tables
-  try {
-    await queryD1(cfg, `ALTER TABLE media_assets ADD COLUMN storage_location TEXT NOT NULL DEFAULT 'd1'`);
-  } catch {
-    // column already exists
+function signOAuthState(payload: Record<string, unknown>, secret: string): string {
+  const raw = Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64url');
+  const sig = crypto.createHmac('sha256', secret).update(raw).digest('base64url');
+  return `${raw}.${sig}`;
+}
+
+function verifyOAuthState(state: string, secret: string): Record<string, any> | null {
+  const dot = state.indexOf('.');
+  if (dot <= 0) return null;
+  const raw = state.slice(0, dot);
+  const sig = state.slice(dot + 1);
+  const expected = crypto.createHmac('sha256', secret).update(raw).digest('base64url');
+  if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+    return null;
   }
   try {
-    await queryD1(cfg, `ALTER TABLE media_assets ADD COLUMN bucket_key TEXT`);
+    return JSON.parse(Buffer.from(raw, 'base64url').toString('utf-8')) as Record<string, any>;
   } catch {
-    // column already exists
-  }
-  await queryD1(
-    cfg,
-    `CREATE TABLE IF NOT EXISTS conversations (
-      id TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      mode TEXT NOT NULL,
-      model_id TEXT NOT NULL,
-      provider_id TEXT NOT NULL,
-      repo_full_name TEXT,
-      repo_branch TEXT,
-      status TEXT NOT NULL DEFAULT 'active',
-      messages_json TEXT,
-      storage_location TEXT NOT NULL DEFAULT 'd1',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )`
-  );
-  try {
-    await queryD1(cfg, `ALTER TABLE conversations ADD COLUMN messages_json TEXT`);
-  } catch {
-    // already exists
+    return null;
   }
 }
+
+// D1 schema initialization is handled by testAndInitExternalDb in functions/_db-adapters.ts
 
 function getAppUrl(req: Request): string {
   if (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL') {
@@ -446,10 +520,14 @@ async function createServer() {
 
   // Public environment capability discovery (never exposes secret values)
   app.get('/api/config/public', (req, res) => {
-    const d1Cfg = getD1Config();
+    const dbCfg = getDbConfig();
     const bucketCfg = getBucketConfig();
     const pwInfo = hasAnyAdminPassword();
+    const store = getAdminStore();
     const isAdmin = isRequestAdmin(req);
+    const ghOAuth = getGitOAuthCredentials('github');
+    const glOAuth = getGitOAuthCredentials('gitlab');
+    const geOAuth = getGitOAuthCredentials('gitee');
 
     const openaiModelsRaw = process.env.OPENAI_MODELS || 'gpt-4o-mini';
     const openaiModels = openaiModelsRaw
@@ -461,6 +539,7 @@ async function createServer() {
       isAdmin,
       hasAdminPassword: pwInfo.hasPassword,
       usingEnvPassword: pwInfo.usingEnv,
+      requireLoginGate: Boolean(store.requireLoginGate),
       defaultTargetRepoUrl: getDefaultTargetRepoUrl(),
       appUrl: getAppUrl(req),
       envProviders: {
@@ -473,14 +552,20 @@ async function createServer() {
         openaiBaseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
         openaiModels,
       },
-      d1Bound: Boolean(d1Cfg),
+      d1Bound: Boolean(dbCfg),
+      dbProvider: dbCfg?.provider || 'local',
       bucketBound: Boolean(bucketCfg),
-      githubOAuthConfigured: Boolean(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET),
+      githubOAuthConfigured: Boolean(ghOAuth.clientId && ghOAuth.clientSecret),
+      gitOAuthProviders: {
+        github: Boolean(ghOAuth.clientId && ghOAuth.clientSecret),
+        gitlab: Boolean(glOAuth.clientId && glOAuth.clientSecret),
+        gitee: Boolean(geOAuth.clientId && geOAuth.clientSecret),
+      },
     });
   });
 
   // ==========================================
-  // Admin Auth Routes (Default No Login Gate; Admin Unlocks Admin Tools)
+  // Admin Auth Routes (Configurable Global Login Gate; Admin Unlocks Admin Tools)
   // ==========================================
   app.post('/api/auth/admin-login', (req, res) => {
     const { password = '' } = req.body as { password?: string };
@@ -493,7 +578,6 @@ async function createServer() {
         return;
       }
     } else if (password.trim()) {
-      // First-time convenient setup if user entered a new password while none existed
       const salt = crypto.randomBytes(16).toString('hex');
       store.salt = salt;
       store.passwordHash = hashPassword(password.trim(), salt);
@@ -502,13 +586,7 @@ async function createServer() {
     }
 
     const token = signAdminSession(store.sessionSecret);
-    const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
-    res.cookie('bcai_admin', token, {
-      httpOnly: true,
-      secure: isHttps,
-      sameSite: isHttps ? 'none' : 'lax',
-      maxAge: 14 * 24 * 60 * 60 * 1000,
-    });
+    setIframeCookie(res, 'bcai_admin', token);
     res.json({
       ok: true,
       isAdmin: true,
@@ -517,10 +595,24 @@ async function createServer() {
     });
   });
 
-  app.post('/api/auth/admin-logout', (req, res) => {
-    const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
-    res.clearCookie('bcai_admin', { secure: isHttps, sameSite: isHttps ? 'none' : 'lax' });
+  app.post('/api/auth/admin-logout', (_req, res) => {
+    clearIframeCookie(res, 'bcai_admin');
     res.json({ ok: true, isAdmin: false });
+  });
+
+  app.post('/api/auth/login-gate', requireAdmin, (req, res) => {
+    const { enabled } = req.body as { enabled?: boolean };
+    const store = getAdminStore();
+    store.requireLoginGate = Boolean(enabled);
+    store.updatedAt = new Date().toISOString();
+    writeJsonFile(ADMIN_AUTH_FILE, store);
+    res.json({
+      ok: true,
+      requireLoginGate: store.requireLoginGate,
+      message: store.requireLoginGate
+        ? '已开启全站访问限制：未登录管理员将看到登录拦截界面'
+        : '已关闭全站访问限制：普通访客可直接进入编程、绘图与对话区',
+    });
   });
 
   app.post('/api/auth/admin-password', requireAdmin, (req, res) => {
@@ -559,6 +651,16 @@ async function createServer() {
       message: '管理员密码已更新保存，下次可使用新密码或后台变量密码登录',
       hasAdminPassword: true,
     });
+  });
+
+  // Enforce global login gate on AI execution routes when toggled ON
+  app.use(['/api/chat', '/api/image', '/api/providers/probe'], (req, res, next) => {
+    const store = getAdminStore();
+    if (store.requireLoginGate && !isRequestAdmin(req)) {
+      res.status(401).json({ error: '工作台已开启管理员登录拦截开关，请先登录管理员后使用。' });
+      return;
+    }
+    next();
   });
 
   // Real live connectivity probe for providers (never fakes green!)
@@ -980,97 +1082,93 @@ async function createServer() {
   });
 
   // ==========================================
-  // Database (Cloudflare D1 Priority + Local Fallback) — Admin Only
+  // Multi-Database (Cloudflare D1 / Turso / Supabase / Neon / Upstash + Local Fallback) — Admin Only
   // ==========================================
   app.get('/api/db/status', requireAdmin, async (_req, res) => {
-    const cfg = getD1Config();
+    const cfg = getDbConfig();
     if (!cfg) {
       const local = readJsonFile<{ items: MediaAssetRecord[] }>(LOCAL_DB_FILE, { items: [] });
       res.json({
         mode: 'local-fallback',
+        provider: 'local',
         connected: false,
         d1Bound: false,
-        label: '未绑定远程 D1（当前使用本地持久化 .data/bcai-db.json）',
+        label: '未绑定远程数据库（当前使用本地持久化 .data/bcai-db.json）',
         itemCount: local.items.length,
       });
       return;
     }
 
     try {
-      await ensureD1Tables(cfg);
-      const rows = await queryD1(cfg, 'SELECT COUNT(*) as cnt FROM media_assets');
-      const count = rows?.[0]?.cnt ?? 0;
+      const info = await testAndInitExternalDb(cfg);
       res.json({
-        mode: 'cloudflare-d1-http',
+        mode: cfg.provider === 'd1-http' ? 'cloudflare-d1-http' : cfg.provider,
+        provider: cfg.provider,
         connected: true,
         d1Bound: true,
-        accountIdMasked: `${cfg.accountId.slice(0, 6)}...`,
-        databaseIdMasked: `${cfg.databaseId.slice(0, 8)}...`,
-        label: 'Cloudflare D1 远程数据库已连通',
-        itemCount: Number(count),
+        label: info.label,
+        itemCount: info.count,
       });
     } catch (err: any) {
       res.json({
-        mode: 'cloudflare-d1-http',
+        mode: cfg.provider === 'd1-http' ? 'cloudflare-d1-http' : cfg.provider,
+        provider: cfg.provider,
         connected: false,
         d1Bound: true,
-        label: `Cloudflare D1 连接异常: ${err?.message || '请检查凭证或建表'}`,
+        label: `${dbProviderLabel(cfg.provider)} 连接异常: ${err?.message || '请检查凭证'}`,
         error: err?.message,
       });
     }
   });
 
   app.post('/api/db/config', requireAdmin, async (req, res) => {
-    const { accountId, databaseId, apiToken, clear } = req.body as {
-      accountId?: string;
-      databaseId?: string;
-      apiToken?: string;
-      clear?: boolean;
-    };
+    const body = req.body as Partial<ExternalDbConfig> & { clear?: boolean };
 
-    if (clear) {
+    if (body.clear) {
       if (fs.existsSync(D1_CFG_FILE)) fs.unlinkSync(D1_CFG_FILE);
       res.json({ ok: true, mode: 'local-fallback' });
       return;
     }
 
-    if (!accountId || !databaseId || !apiToken) {
-      res.status(400).json({ error: '请填写完整的 Account ID、D1 Database ID 和 API Token' });
-      return;
-    }
-
-    const cfg: D1BindingConfig = {
-      accountId: accountId.trim(),
-      databaseId: databaseId.trim(),
-      apiToken: apiToken.trim(),
+    const provider: ExternalDbProvider = (body.provider as ExternalDbProvider) || 'd1-http';
+    const cfg: ExternalDbConfig = {
+      provider,
+      accountId: body.accountId?.trim(),
+      databaseId: body.databaseId?.trim(),
+      apiToken: body.apiToken?.trim(),
+      tursoUrl: body.tursoUrl?.trim(),
+      tursoAuthToken: body.tursoAuthToken?.trim(),
+      supabaseUrl: body.supabaseUrl?.trim(),
+      supabaseKey: body.supabaseKey?.trim(),
+      neonConnectionString: body.neonConnectionString?.trim(),
+      upstashUrl: body.upstashUrl?.trim(),
+      upstashToken: body.upstashToken?.trim(),
     };
+
     try {
-      await ensureD1Tables(cfg);
+      const info = await testAndInitExternalDb(cfg);
       writeJsonFile(D1_CFG_FILE, cfg);
       res.json({
         ok: true,
-        mode: 'cloudflare-d1-http',
-        message: 'D1 绑定成功并已自动初始化 media_assets 与 conversations 表结构',
+        provider,
+        mode: provider === 'd1-http' ? 'cloudflare-d1-http' : provider,
+        message: `${info.label}（已自动完成表结构校验与初始化）`,
       });
     } catch (err: any) {
-      res.status(400).json({ error: `D1 验证或建表失败: ${err?.message || '未知错误'}` });
+      res.status(400).json({ error: `${dbProviderLabel(provider)} 验证失败: ${err?.message || '未知错误'}` });
     }
   });
 
   app.get('/api/db/items', requireAdmin, async (req, res) => {
     const typeFilter = (req.query.type as string) || '';
-    const cfg = getD1Config();
+    const cfg = getDbConfig();
     if (cfg) {
       try {
-        await ensureD1Tables(cfg);
-        const rows = typeFilter
-          ? await queryD1(cfg, 'SELECT * FROM media_assets WHERE type = ? ORDER BY updated_at DESC LIMIT 100', [typeFilter])
-          : await queryD1(cfg, 'SELECT * FROM media_assets ORDER BY updated_at DESC LIMIT 100');
-        const normalized = rows.map((r) => ({ ...r, storage_location: r.storage_location || 'd1' }));
-        res.json({ mode: 'cloudflare-d1-http', items: normalized });
+        const rows = await listExternalDbAssets(cfg, typeFilter);
+        res.json({ mode: cfg.provider === 'd1-http' ? 'cloudflare-d1-http' : cfg.provider, items: rows });
         return;
       } catch (err: any) {
-        res.status(500).json({ error: `读取 D1 失败: ${err?.message}` });
+        res.status(500).json({ error: `读取数据库失败: ${err?.message}` });
         return;
       }
     }
@@ -1098,8 +1196,9 @@ async function createServer() {
       bucketKey?: string;
     };
     const now = new Date().toISOString();
-    const cfg = getD1Config();
-    const storageLoc: 'd1' | 'bucket' | 'local' = body.storageLocation || (cfg ? 'd1' : 'local');
+    const cfg = getDbConfig();
+    const defaultLoc = cfg ? (cfg.provider === 'd1-http' ? 'd1' : cfg.provider) : 'local';
+    const storageLoc = body.storageLocation || defaultLoc;
 
     const record: MediaAssetRecord = {
       id: body.id || `asset_${Date.now()}`,
@@ -1111,7 +1210,7 @@ async function createServer() {
       model_id: body.modelId || '',
       content_data: body.contentData || '',
       repo_path: body.repoPath || '',
-      storage_location: storageLoc,
+      storage_location: (storageLoc === 'd1' || storageLoc === 'bucket' || storageLoc === 'local' ? storageLoc : 'd1') as 'd1' | 'bucket' | 'local',
       bucket_key: body.bucketKey || '',
       created_at: now,
       updated_at: now,
@@ -1119,32 +1218,11 @@ async function createServer() {
 
     if (cfg) {
       try {
-        await ensureD1Tables(cfg);
-        await queryD1(
-          cfg,
-          `INSERT OR REPLACE INTO media_assets
-           (id, type, name, mime_type, size_bytes, prompt, model_id, content_data, repo_path, storage_location, bucket_key, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            record.id,
-            record.type,
-            record.name,
-            record.mime_type,
-            record.size_bytes,
-            record.prompt,
-            record.model_id,
-            record.content_data,
-            record.repo_path,
-            record.storage_location,
-            record.bucket_key,
-            record.created_at,
-            record.updated_at,
-          ]
-        );
-        res.json({ ok: true, mode: 'cloudflare-d1-http', storageLocation: record.storage_location, item: record });
+        await upsertExternalDbAsset(cfg, { ...record, storage_location: storageLoc });
+        res.json({ ok: true, mode: cfg.provider, storageLocation: storageLoc, item: { ...record, storage_location: storageLoc } });
         return;
       } catch (err: any) {
-        res.status(500).json({ error: `写入 D1 失败: ${err?.message}` });
+        res.status(500).json({ error: `写入数据库失败: ${err?.message}` });
         return;
       }
     }
@@ -1163,14 +1241,14 @@ async function createServer() {
 
   app.delete('/api/db/items/:id', requireAdmin, async (req, res) => {
     const { id } = req.params;
-    const cfg = getD1Config();
+    const cfg = getDbConfig();
     if (cfg) {
       try {
-        await queryD1(cfg, 'DELETE FROM media_assets WHERE id = ?', [id]);
+        await deleteExternalDbAsset(cfg, id);
         res.json({ ok: true });
         return;
       } catch (err: any) {
-        res.status(500).json({ error: `删除 D1 记录失败: ${err?.message}` });
+        res.status(500).json({ error: `删除记录失败: ${err?.message}` });
         return;
       }
     }
@@ -1181,7 +1259,7 @@ async function createServer() {
   });
 
   // ==========================================
-  // Storage Bucket (Cloudflare R2 / S3-Compatible HTTP) — Admin Only
+  // Storage Bucket (Cloudflare R2 / Aliyun OSS / Tencent COS / AWS S3 / MinIO / B2) — Admin Only
   // ==========================================
   app.get('/api/bucket/status', requireAdmin, async (_req, res) => {
     const cfg = getBucketConfig();
@@ -1190,7 +1268,7 @@ async function createServer() {
         configured: false,
         connected: false,
         mode: 'unconfigured',
-        label: '未绑定对象存储桶（请配置 Cloudflare R2 或 S3 兼容存储桶）',
+        label: '未绑定对象存储桶（支持 R2 / 阿里云 OSS / 腾讯云 COS / S3 / MinIO）',
       });
       return;
     }
@@ -1217,12 +1295,13 @@ async function createServer() {
   });
 
   app.post('/api/bucket/config', requireAdmin, async (req, res) => {
-    const { endpoint, region = 'auto', bucket, accessKeyId, secretAccessKey, clear } = req.body as {
+    const { endpoint, region = 'auto', bucket, accessKeyId, secretAccessKey, addressingStyle, clear } = req.body as {
       endpoint?: string;
       region?: string;
       bucket?: string;
       accessKeyId?: string;
       secretAccessKey?: string;
+      addressingStyle?: 'path' | 'virtual';
       clear?: boolean;
     };
 
@@ -1233,7 +1312,7 @@ async function createServer() {
     }
 
     if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) {
-      res.status(400).json({ error: '请填写完整的 S3/R2 Endpoint、Bucket 名称、Access Key ID 与 Secret Access Key' });
+      res.status(400).json({ error: '请填写完整的 S3/R2/OSS/COS Endpoint、Bucket 名称、Access Key ID 与 Secret Access Key' });
       return;
     }
 
@@ -1243,6 +1322,7 @@ async function createServer() {
       bucket: bucket.trim(),
       accessKeyId: accessKeyId.trim(),
       secretAccessKey: secretAccessKey.trim(),
+      ...(addressingStyle ? { addressingStyle } : {}),
     };
 
     try {
@@ -1304,8 +1384,8 @@ async function createServer() {
       }
       await s3PutObject(cfg, key, payloadBytes, mimeType);
 
-      // Record metadata in D1/local with storage_location='bucket'
-      const d1Cfg = getD1Config();
+      // Record metadata in external DB / local with storage_location='bucket'
+      const dbCfg = getDbConfig();
       const now = new Date().toISOString();
       const record: MediaAssetRecord = {
         id: `bkt_${Date.now()}`,
@@ -1321,32 +1401,11 @@ async function createServer() {
         created_at: now,
         updated_at: now,
       };
-      if (d1Cfg) {
+      if (dbCfg) {
         try {
-          await ensureD1Tables(d1Cfg);
-          await queryD1(
-            d1Cfg,
-            `INSERT OR REPLACE INTO media_assets
-             (id, type, name, mime_type, size_bytes, prompt, model_id, content_data, repo_path, storage_location, bucket_key, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              record.id,
-              record.type,
-              record.name,
-              record.mime_type,
-              record.size_bytes,
-              record.prompt,
-              record.model_id,
-              record.content_data,
-              '',
-              'bucket',
-              key,
-              now,
-              now,
-            ]
-          );
+          await upsertExternalDbAsset(dbCfg, record);
         } catch {
-          // ignore D1 index write failure if bucket succeeded
+          // ignore DB index write failure if bucket succeeded
         }
       } else {
         const local = readJsonFile<{ items: MediaAssetRecord[] }>(LOCAL_DB_FILE, { items: [] });
@@ -1388,10 +1447,10 @@ async function createServer() {
     try {
       await s3DeleteObject(cfg, key);
       // Also clean index row if present
-      const d1Cfg = getD1Config();
-      if (d1Cfg) {
+      const dbCfg = getDbConfig();
+      if (dbCfg) {
         try {
-          await queryD1(d1Cfg, 'DELETE FROM media_assets WHERE bucket_key = ?', [key]);
+          await deleteExternalDbAssetByBucketKey(dbCfg, key);
         } catch {
           // ignore
         }
@@ -1407,23 +1466,23 @@ async function createServer() {
   });
 
   // ==========================================
-  // Conversation History Sync (D1 + Storage Bucket) — Admin Only
+  // Conversation History Sync (Multi-DB + Storage Bucket) — Admin Only
   // ==========================================
   app.post('/api/sync/conversations', requireAdmin, async (req, res) => {
     const { conversations = [], target = 'auto' } = req.body as {
       conversations?: any[];
       target?: 'auto' | 'd1' | 'bucket' | 'both';
     };
-    const d1Cfg = getD1Config();
+    const dbCfg = getDbConfig();
     const bucketCfg = getBucketConfig();
 
-    const wantD1 = target === 'd1' || target === 'both' || (target === 'auto' && Boolean(d1Cfg));
+    const wantDb = target === 'd1' || target === 'both' || (target === 'auto' && Boolean(dbCfg));
     const wantBucket = target === 'bucket' || target === 'both' || (target === 'auto' && Boolean(bucketCfg));
 
-    if (!wantD1 && !wantBucket) {
+    if (!wantDb && !wantBucket) {
       res.status(400).json({
         ok: false,
-        error: '尚未绑定 Cloudflare D1 数据库或对象存储桶，请先完成至少一项绑定后再同步对话历史。',
+        error: '尚未绑定远程数据库或对象存储桶，请先完成至少一项绑定后再同步对话历史。',
       });
       return;
     }
@@ -1435,36 +1494,15 @@ async function createServer() {
       errors: [],
     };
 
-    if (wantD1) {
-      if (!d1Cfg) {
-        results.errors.push('未配置 D1 数据库');
+    if (wantDb) {
+      if (!dbCfg) {
+        results.errors.push('未配置远程数据库');
       } else {
         try {
-          await ensureD1Tables(d1Cfg);
-          for (const c of conversations.slice(0, 80)) {
-            await queryD1(
-              d1Cfg,
-              `INSERT OR REPLACE INTO conversations
-               (id, title, mode, model_id, provider_id, repo_full_name, repo_branch, status, messages_json, storage_location, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'd1', ?, ?)`,
-              [
-                c.id,
-                c.title || '未命名会话',
-                c.mode || 'chat',
-                c.modelId || '',
-                c.providerId || '',
-                c.repoFullName || '',
-                c.repoBranch || '',
-                c.status || 'active',
-                JSON.stringify(c.messages || []),
-                c.createdAt || now,
-                c.updatedAt || now,
-              ]
-            );
-          }
+          await syncExternalDbConversations(dbCfg, conversations, now);
           results.d1 = true;
         } catch (err: any) {
-          results.errors.push(`D1 同步失败: ${err?.message}`);
+          results.errors.push(`数据库同步失败: ${err?.message}`);
         }
       }
     }
@@ -1484,24 +1522,29 @@ async function createServer() {
     }
 
     const ok = results.d1 || results.bucket;
+    const syncedLabels = [
+      results.d1 && dbCfg ? dbProviderLabel(dbCfg.provider) : '',
+      results.bucket ? '存储桶' : '',
+    ].filter(Boolean);
+
     res.status(ok ? 200 : 500).json({
       ok,
       syncedAt: now,
       count: conversations.length,
-      targets: { d1: results.d1, bucket: results.bucket },
+      targets: syncedLabels,
       errors: results.errors,
       message: ok
-        ? `已成功同步 ${conversations.length} 个会话至 ${[results.d1 ? 'Cloudflare D1' : '', results.bucket ? '存储桶' : ''].filter(Boolean).join(' + ')}`
+        ? `已成功同步 ${conversations.length} 个会话至 ${syncedLabels.join(' + ')}`
         : results.errors.join('；'),
     });
   });
 
   app.get('/api/sync/conversations', requireAdmin, async (req, res) => {
     const source = (req.query.source as string) || 'auto';
-    const d1Cfg = getD1Config();
+    const dbCfg = getDbConfig();
     const bucketCfg = getBucketConfig();
 
-    if ((source === 'bucket' || (source === 'auto' && !d1Cfg && bucketCfg)) && bucketCfg) {
+    if ((source === 'bucket' || (source === 'auto' && !dbCfg && bucketCfg)) && bucketCfg) {
       try {
         const obj = await s3GetObject(bucketCfg, 'bcai-sync/conversations.json');
         const parsed = JSON.parse(Buffer.from(obj.bytes).toString('utf-8')) as { conversations?: any[]; syncedAt?: string };
@@ -1515,109 +1558,263 @@ async function createServer() {
       }
     }
 
-    if (d1Cfg) {
+    if (dbCfg) {
       try {
-        await ensureD1Tables(d1Cfg);
-        const rows = await queryD1(d1Cfg, 'SELECT * FROM conversations ORDER BY updated_at DESC LIMIT 80');
-        const conversations = rows.map((r) => ({
-          id: r.id,
-          title: r.title,
-          mode: r.mode || 'chat',
-          modelId: r.model_id,
-          providerId: r.provider_id,
-          repoFullName: r.repo_full_name || undefined,
-          repoBranch: r.repo_branch || undefined,
-          status: r.status || 'active',
-          messages: r.messages_json ? JSON.parse(r.messages_json) : [],
-          createdAt: r.created_at,
-          updatedAt: r.updated_at,
-        }));
-        res.json({ ok: true, source: 'd1', conversations, syncedAt: new Date().toISOString() });
+        const conversations = await fetchExternalDbConversations(dbCfg);
+        res.json({ ok: true, source: dbCfg.provider, conversations, syncedAt: new Date().toISOString() });
         return;
       } catch (err: any) {
-        res.status(500).json({ error: `从 D1 拉取失败: ${err?.message}` });
+        res.status(500).json({ error: `从数据库拉取失败: ${err?.message}` });
         return;
       }
     }
 
-    res.status(400).json({ error: '尚未绑定 D1 数据库或对象存储桶' });
+    res.status(400).json({ error: '尚未绑定远程数据库或对象存储桶' });
   });
 
   // ==========================================
-  // Multi-Git Provider APIs (GitHub, GitLab, Gitee) — Admin Only
+  // Multi-Git Provider OAuth & Repo APIs (GitHub, GitLab, Gitee) — Admin Only
   // ==========================================
-  app.get('/api/auth/github/url', (req, res) => {
-    const clientId = process.env.GITHUB_CLIENT_ID;
-    if (!clientId) {
-      res.status(400).json({
-        error: '未配置 GITHUB_CLIENT_ID 环境变量。可直接使用 Token 方式连接，或在环境变量设置 GITHUB_CLIENT_ID 与 GITHUB_CLIENT_SECRET。',
-      });
-      return;
-    }
-    const redirectUri = `${getAppUrl(req)}/auth/callback`;
-    const params = new URLSearchParams({
-      client_id: clientId,
-      redirect_uri: redirectUri,
-      scope: 'repo read:user',
+  app.get('/api/git/oauth-config', requireAdmin, (_req, res) => {
+    const saved = readJsonFile<GitOAuthConfigStore>(GIT_OAUTH_CFG_FILE, {});
+    const gh = getGitOAuthCredentials('github');
+    const gl = getGitOAuthCredentials('gitlab');
+    const ge = getGitOAuthCredentials('gitee');
+    res.json({
+      siteId: saved.siteId || '',
+      github: { clientId: gh.clientId, configured: Boolean(gh.clientId && gh.clientSecret) },
+      gitlab: { clientId: gl.clientId, hostUrl: gl.hostUrl, configured: Boolean(gl.clientId && gl.clientSecret) },
+      gitee: { clientId: ge.clientId, configured: Boolean(ge.clientId && ge.clientSecret) },
     });
-    res.json({ url: `https://github.com/login/oauth/authorize?${params.toString()}`, redirectUri });
   });
 
-  const handleGitHubCallback = async (req: Request, res: Response) => {
-    const code = req.query.code as string | undefined;
-    const clientId = process.env.GITHUB_CLIENT_ID;
-    const clientSecret = process.env.GITHUB_CLIENT_SECRET;
-    if (!code || !clientId || !clientSecret) {
-      res.status(400).send('缺少授权码 code 或 GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET');
+  app.post('/api/git/oauth-config', requireAdmin, (req, res) => {
+    const body = req.body as {
+      siteId?: string;
+      provider?: 'github' | 'gitlab' | 'gitee';
+      clientId?: string;
+      clientSecret?: string;
+      hostUrl?: string;
+    };
+    const saved = readJsonFile<GitOAuthConfigStore>(GIT_OAUTH_CFG_FILE, {});
+    if (typeof body.siteId === 'string') {
+      saved.siteId = body.siteId.trim();
+    }
+    if (body.provider) {
+      const prev = saved[body.provider] || {};
+      saved[body.provider] = {
+        clientId: typeof body.clientId === 'string' ? body.clientId.trim() : prev.clientId,
+        clientSecret: body.clientSecret && body.clientSecret.trim() ? body.clientSecret.trim() : prev.clientSecret,
+        ...(body.provider === 'gitlab' && body.hostUrl ? { hostUrl: body.hostUrl.trim().replace(/\/+$/, '') } : {}),
+      };
+    }
+    writeJsonFile(GIT_OAUTH_CFG_FILE, saved);
+    const creds = body.provider ? getGitOAuthCredentials(body.provider, body.hostUrl) : null;
+    res.json({
+      ok: true,
+      siteId: saved.siteId || '',
+      configured: creds ? Boolean(creds.clientId && creds.clientSecret) : undefined,
+      message: '已保存仓库站点 OAuth 应用与站点 ID 配置',
+    });
+  });
+
+  const buildGitOAuthUrl = (req: Request, provider: 'github' | 'gitlab' | 'gitee', hostUrlParam?: string) => {
+    const creds = getGitOAuthCredentials(provider, hostUrlParam);
+    if (!creds.clientId || !creds.clientSecret) {
+      return {
+        error: `未配置 ${provider.toUpperCase()} OAuth Client ID / Client Secret。可在环境变量或当前页面“连接仓库站点（OAuth 授权）”区填写保存后再发起授权。`,
+      };
+    }
+    const store = getAdminStore();
+    const redirectUri = `${getAppUrl(req)}/auth/callback`;
+    const state = signOAuthState(
+      {
+        provider,
+        hostUrl: creds.hostUrl,
+        nonce: crypto.randomBytes(8).toString('hex'),
+        ts: Date.now(),
+      },
+      store.sessionSecret
+    );
+
+    if (provider === 'github') {
+      const params = new URLSearchParams({
+        client_id: creds.clientId,
+        redirect_uri: redirectUri,
+        scope: 'repo read:user',
+        state,
+      });
+      return { url: `https://github.com/login/oauth/authorize?${params.toString()}`, redirectUri };
+    }
+
+    if (provider === 'gitlab') {
+      const params = new URLSearchParams({
+        client_id: creds.clientId,
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        scope: 'api read_user write_repository',
+        state,
+      });
+      return { url: `${creds.hostUrl}/oauth/authorize?${params.toString()}`, redirectUri };
+    }
+
+    // Gitee OAuth
+    const params = new URLSearchParams({
+      client_id: creds.clientId,
+      redirect_uri: redirectUri,
+      response_type: 'code',
+      scope: 'user_info projects',
+      state,
+    });
+    return { url: `https://gitee.com/oauth/authorize?${params.toString()}`, redirectUri };
+  };
+
+  app.get('/api/auth/git/url', requireAdmin, (req, res) => {
+    const provider = ((req.query.provider as string) || 'github') as 'github' | 'gitlab' | 'gitee';
+    const hostUrl = (req.query.hostUrl as string) || undefined;
+    const built = buildGitOAuthUrl(req, provider, hostUrl);
+    if (built.error) {
+      res.status(400).json({ error: built.error });
       return;
     }
+    res.json(built);
+  });
+
+  app.get('/api/auth/github/url', requireAdmin, (req, res) => {
+    const built = buildGitOAuthUrl(req, 'github');
+    if (built.error) {
+      res.status(400).json({ error: built.error });
+      return;
+    }
+    res.json(built);
+  });
+
+  const handleGitOAuthCallback = async (req: Request, res: Response) => {
+    const code = req.query.code as string | undefined;
+    const stateParam = (req.query.state as string) || '';
+    const store = getAdminStore();
+    const stateData = stateParam ? verifyOAuthState(stateParam, store.sessionSecret) : { provider: 'github', hostUrl: 'https://github.com' };
+
+    if (!code || !stateData) {
+      res.status(400).send('OAuth 回调缺少有效授权码 code 或 state 校验失败');
+      return;
+    }
+
+    const provider = (stateData.provider || 'github') as 'github' | 'gitlab' | 'gitee';
+    const creds = getGitOAuthCredentials(provider, stateData.hostUrl);
+    if (!creds.clientId || !creds.clientSecret) {
+      res.status(400).send(`缺少 ${provider.toUpperCase()} Client ID / Client Secret`);
+      return;
+    }
+
+    const redirectUri = `${getAppUrl(req)}/auth/callback`;
     try {
-      const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
-        method: 'POST',
-        headers: { accept: 'application/json', 'content-type': 'application/json' },
-        body: JSON.stringify({
-          client_id: clientId,
-          client_secret: clientSecret,
-          code,
-          redirect_uri: `${getAppUrl(req)}/auth/callback`,
-        }),
-      });
-      const tokenJson = (await tokenRes.json()) as { access_token?: string; error_description?: string; error?: string };
-      if (!tokenJson.access_token) {
-        res.status(400).send(`GitHub 授权失败: ${tokenJson.error_description || tokenJson.error || '未知错误'}`);
-        return;
+      let accessToken = '';
+      let user: any = null;
+
+      if (provider === 'github') {
+        const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+          method: 'POST',
+          headers: { accept: 'application/json', 'content-type': 'application/json' },
+          body: JSON.stringify({
+            client_id: creds.clientId,
+            client_secret: creds.clientSecret,
+            code,
+            redirect_uri: redirectUri,
+          }),
+        });
+        const tokenJson = (await tokenRes.json()) as { access_token?: string; error_description?: string; error?: string };
+        if (!tokenJson.access_token) {
+          res.status(400).send(`GitHub 授权失败: ${tokenJson.error_description || tokenJson.error || '未知错误'}`);
+          return;
+        }
+        accessToken = tokenJson.access_token;
+        const userRes = await fetch('https://api.github.com/user', {
+          headers: { authorization: `Bearer ${accessToken}`, 'user-agent': 'bcai-workbench' },
+        });
+        user = await userRes.json();
+        setIframeCookie(res, 'aimx_gh_token', accessToken);
+      } else if (provider === 'gitlab') {
+        const tokenRes = await fetch(`${creds.hostUrl}/oauth/token`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+          body: new URLSearchParams({
+            client_id: creds.clientId,
+            client_secret: creds.clientSecret,
+            code,
+            grant_type: 'authorization_code',
+            redirect_uri: redirectUri,
+          }).toString(),
+        });
+        const tokenJson = (await tokenRes.json()) as { access_token?: string; error_description?: string; error?: string };
+        if (!tokenJson.access_token) {
+          res.status(400).send(`GitLab 授权失败: ${tokenJson.error_description || tokenJson.error || '未知错误'}`);
+          return;
+        }
+        accessToken = tokenJson.access_token;
+        const userRes = await fetch(`${creds.hostUrl}/api/v4/user`, {
+          headers: { authorization: `Bearer ${accessToken}` },
+        });
+        const glUser = (await userRes.json()) as { username?: string; name?: string; avatar_url?: string; web_url?: string };
+        user = {
+          login: glUser.username || glUser.name || 'gitlab-user',
+          name: glUser.name,
+          avatar_url: glUser.avatar_url,
+          html_url: glUser.web_url,
+          provider: 'gitlab',
+        };
+      } else {
+        const tokenRes = await fetch('https://gitee.com/oauth/token', {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+          body: new URLSearchParams({
+            grant_type: 'authorization_code',
+            code,
+            client_id: creds.clientId,
+            client_secret: creds.clientSecret,
+            redirect_uri: redirectUri,
+          }).toString(),
+        });
+        const tokenJson = (await tokenRes.json()) as { access_token?: string; error_description?: string; error?: string };
+        if (!tokenJson.access_token) {
+          res.status(400).send(`Gitee 授权失败: ${tokenJson.error_description || tokenJson.error || '未知错误'}`);
+          return;
+        }
+        accessToken = tokenJson.access_token;
+        const userRes = await fetch(`https://gitee.com/api/v5/user?access_token=${encodeURIComponent(accessToken)}`);
+        const geUser = (await userRes.json()) as { login?: string; name?: string; avatar_url?: string; html_url?: string };
+        user = {
+          login: geUser.login || geUser.name || 'gitee-user',
+          name: geUser.name,
+          avatar_url: geUser.avatar_url,
+          html_url: geUser.html_url,
+          provider: 'gitee',
+        };
       }
 
-      const userRes = await fetch('https://api.github.com/user', {
-        headers: { authorization: `Bearer ${tokenJson.access_token}`, 'user-agent': 'bcai-workbench' },
-      });
-      const user = await userRes.json();
-
-      res.cookie('aimx_gh_token', tokenJson.access_token, {
-        httpOnly: true,
-        secure: true,
-        sameSite: 'none',
-        maxAge: 14 * 24 * 60 * 60 * 1000,
-      });
+      const savedMap = readJsonFile<Record<string, string>>(GIT_CFG_FILE, {});
+      savedMap[provider] = accessToken;
+      writeJsonFile(GIT_CFG_FILE, savedMap);
 
       res.send(`<!doctype html>
         <html lang="zh-CN">
-          <head><meta charset="utf-8"><title>GitHub 授权完成</title></head>
+          <head><meta charset="utf-8"><title>${provider.toUpperCase()} OAuth 授权完成</title></head>
           <body style="font-family:system-ui,sans-serif;padding:24px;text-align:center;">
             <script>
               if (window.opener) {
                 window.opener.postMessage({
                   type: 'OAUTH_AUTH_SUCCESS',
-                  provider: 'github',
+                  provider: ${JSON.stringify(provider)},
+                  hostUrl: ${JSON.stringify(creds.hostUrl)},
                   user: ${JSON.stringify(user)},
-                  token: ${JSON.stringify(tokenJson.access_token)}
+                  token: ${JSON.stringify(accessToken)}
                 }, '*');
                 window.close();
               } else {
                 window.location.href = '/';
               }
             </script>
-            <p>GitHub 授权成功，正在返回 BCAI 工作台...</p>
+            <p>${provider.toUpperCase()} OAuth 授权成功，正在返回 BCAI 工作台...</p>
           </body>
         </html>`);
     } catch (err: any) {
@@ -1625,7 +1822,7 @@ async function createServer() {
     }
   };
 
-  app.get(['/auth/callback', '/auth/callback/'], handleGitHubCallback);
+  app.get(['/auth/callback', '/auth/callback/'], handleGitOAuthCallback);
 
   app.post('/api/git/connect', requireAdmin, async (req, res) => {
     const {
@@ -1650,12 +1847,7 @@ async function createServer() {
         });
         if (!r.ok) throw new Error(`GitHub 验证失败 (HTTP ${r.status})`);
         user = await r.json();
-        res.cookie('aimx_gh_token', cleanToken, {
-          httpOnly: true,
-          secure: true,
-          sameSite: 'none',
-          maxAge: 14 * 24 * 60 * 60 * 1000,
-        });
+        setIframeCookie(res, 'aimx_gh_token', cleanToken);
       } else if (provider === 'gitlab') {
         const base = (hostUrl || 'https://gitlab.com').replace(/\/+$/, '');
         const r = await fetch(`${base}/api/v4/user`, {
@@ -1699,7 +1891,7 @@ async function createServer() {
     delete savedMap[provider];
     writeJsonFile(GIT_CFG_FILE, savedMap);
     if (provider === 'github') {
-      res.clearCookie('aimx_gh_token', { secure: true, sameSite: 'none' });
+      clearIframeCookie(res, 'aimx_gh_token');
     }
     res.json({ ok: true });
   });
@@ -2502,6 +2694,7 @@ async function createServer() {
       }
 
       if (presetKey === 'webdav' || presetKey === 'alist') {
+        assertSafeExternalUrl(endpoint);
         const headers: Record<string, string> = {};
         if (usernameOrId && secretToken) {
           headers.authorization = `Basic ${Buffer.from(`${usernameOrId}:${secretToken}`).toString('base64')}`;
@@ -2521,7 +2714,6 @@ async function createServer() {
         return;
       }
 
-      // Generic Google Drive / OneDrive / Webhook / Custom endpoint probe
       const headers: Record<string, string> = {};
       if (secretToken) headers.authorization = `Bearer ${secretToken}`;
       const targetUrl =
@@ -2535,6 +2727,7 @@ async function createServer() {
         res.json({ status: 'unconfigured', message: '请填写检测端点 URL' });
         return;
       }
+      assertSafeExternalUrl(targetUrl);
       const r = await fetch(targetUrl, { method: 'GET', headers });
       res.json({
         status: r.ok ? 'connected' : 'error',
@@ -2547,6 +2740,170 @@ async function createServer() {
         latencyMs: Date.now() - start,
         message: err?.message || '连接探测失败',
       });
+    }
+  });
+
+  // Save AI-generated code directly from Chat to a connected Connector (WebDAV / Alist / OneDrive / Google Drive / Webhook)
+  app.post('/api/connectors/save-code', requireAdmin, async (req, res) => {
+    const {
+      connectorId,
+      filename = `bcai-snippet-${Date.now()}.txt`,
+      targetDir = '',
+      code = '',
+      lang = 'text',
+      conversationTitle = '',
+    } = req.body as {
+      connectorId: string;
+      filename?: string;
+      targetDir?: string;
+      code: string;
+      lang?: string;
+      conversationTitle?: string;
+    };
+
+    if (!connectorId || !code) {
+      res.status(400).json({ error: '缺少 connectorId 或代码内容' });
+      return;
+    }
+
+    const items = readJsonFile<any[]>(CONNECTORS_FILE, []);
+    const conn = items.find((c) => c.id === connectorId);
+    if (!conn) {
+      res.status(404).json({ error: '未找到对应的已连接连接器' });
+      return;
+    }
+
+    const cleanFile = filename.replace(/[/\\:*?"<>|]/g, '_').replace(/^\.+/, '') || `snippet-${Date.now()}.txt`;
+    const baseDir = (targetDir || conn.extraConfig || 'bcai-code')
+      .split('/')
+      .map((seg: string) => seg.trim())
+      .filter((seg: string) => seg && seg !== '.' && seg !== '..')
+      .join('/');
+    const relPath = baseDir ? `${baseDir}/${cleanFile}` : cleanFile;
+
+    try {
+      if (conn.presetKey === 'webdav') {
+        assertSafeExternalUrl(conn.endpoint);
+        const putUrl = `${String(conn.endpoint).replace(/\/+$/, '')}/${relPath.split('/').map(encodeURIComponent).join('/')}`;
+        const headers: Record<string, string> = { 'content-type': 'text/plain; charset=utf-8' };
+        if (conn.usernameOrId && conn.secretToken) {
+          headers.authorization = `Basic ${Buffer.from(`${conn.usernameOrId}:${conn.secretToken}`).toString('base64')}`;
+        } else if (conn.secretToken) {
+          headers.authorization = `Bearer ${conn.secretToken}`;
+        }
+        const r = await fetch(putUrl, { method: 'PUT', headers, body: code });
+        if (!r.ok && r.status !== 201 && r.status !== 204) {
+          throw new Error(`WebDAV 上传失败 (HTTP ${r.status})`);
+        }
+        res.json({ ok: true, connectorName: conn.name, targetPath: relPath, message: `已写入 WebDAV：/${relPath}` });
+        return;
+      }
+
+      if (conn.presetKey === 'alist') {
+        assertSafeExternalUrl(conn.endpoint);
+        const putUrl = `${String(conn.endpoint).replace(/\/+$/, '')}/api/fs/put`;
+        const headers: Record<string, string> = {
+          'content-type': 'text/plain; charset=utf-8',
+          'file-path': encodeURIComponent(`/${relPath}`),
+        };
+        if (conn.secretToken) headers.authorization = conn.secretToken;
+        const r = await fetch(putUrl, { method: 'PUT', headers, body: code });
+        const j = (await r.json().catch(() => ({}))) as { code?: number; message?: string };
+        if (!r.ok || (typeof j.code === 'number' && j.code !== 200)) {
+          throw new Error(j.message || `Alist 上传失败 (HTTP ${r.status})`);
+        }
+        res.json({ ok: true, connectorName: conn.name, targetPath: `/${relPath}`, message: `已存入 Alist 网盘：/${relPath}` });
+        return;
+      }
+
+      if (conn.presetKey === 'onedrive') {
+        if (!conn.secretToken) throw new Error('OneDrive 连接器缺少 OAuth Token');
+        const putUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${relPath.split('/').map(encodeURIComponent).join('/')}:/content`;
+        const r = await fetch(putUrl, {
+          method: 'PUT',
+          headers: {
+            authorization: `Bearer ${conn.secretToken}`,
+            'content-type': 'text/plain; charset=utf-8',
+          },
+          body: code,
+        });
+        if (!r.ok) throw new Error(`OneDrive 上传失败 (HTTP ${r.status})`);
+        res.json({ ok: true, connectorName: conn.name, targetPath: `/${relPath}`, message: `已存入 OneDrive：/${relPath}` });
+        return;
+      }
+
+      if (conn.presetKey === 'gdrive') {
+        if (!conn.secretToken) throw new Error('Google Drive 连接器缺少 OAuth Token');
+        const boundary = `bcai_${Date.now()}`;
+        const metadata = JSON.stringify({
+          name: cleanFile,
+          ...(conn.usernameOrId ? { parents: [conn.usernameOrId] } : {}),
+        });
+        const multipartBody = [
+          `--${boundary}`,
+          'Content-Type: application/json; charset=UTF-8',
+          '',
+          metadata,
+          `--${boundary}`,
+          'Content-Type: text/plain; charset=UTF-8',
+          '',
+          code,
+          `--${boundary}--`,
+        ].join('\r\n');
+        const r = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${conn.secretToken}`,
+            'content-type': `multipart/related; boundary=${boundary}`,
+          },
+          body: multipartBody,
+        });
+        if (!r.ok) throw new Error(`Google Drive 上传失败 (HTTP ${r.status})`);
+        res.json({ ok: true, connectorName: conn.name, targetPath: cleanFile, message: `已存入 Google Drive：${cleanFile}` });
+        return;
+      }
+
+      if (conn.presetKey === 'resend' && conn.usernameOrId && conn.secretToken) {
+        const r = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${conn.secretToken}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            from: conn.usernameOrId,
+            to: [conn.extraConfig || conn.usernameOrId],
+            subject: `[BCAI 代码归档] ${cleanFile}`,
+            text: `会话：${conversationTitle || 'BCAI 工作台'}\n语言：${lang}\n\n${code}`,
+          }),
+        });
+        if (!r.ok) throw new Error(`Resend 发送失败 (HTTP ${r.status})`);
+        res.json({ ok: true, connectorName: conn.name, targetPath: cleanFile, message: `已通过 Resend 邮件发送代码：${cleanFile}` });
+        return;
+      }
+
+      // Generic Webhook / Deploy / Custom API endpoint
+      if (!conn.endpoint) throw new Error('连接器未配置接收端点 URL');
+      assertSafeExternalUrl(conn.endpoint);
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      if (conn.secretToken) headers.authorization = `Bearer ${conn.secretToken}`;
+      const r = await fetch(conn.endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          event: 'bcai.save_code',
+          filename: cleanFile,
+          path: relPath,
+          lang,
+          code,
+          conversationTitle,
+          savedAt: new Date().toISOString(),
+        }),
+      });
+      if (!r.ok) throw new Error(`连接器端点返回 HTTP ${r.status}`);
+      res.json({ ok: true, connectorName: conn.name, targetPath: relPath, message: `已推送代码到连接器「${conn.name}」` });
+    } catch (err: any) {
+      res.status(400).json({ error: err?.message || '存入连接器失败' });
     }
   });
 
@@ -2578,7 +2935,38 @@ async function createServer() {
     }
   });
 
-  // Downloadable Cloudflare Pages Upload Package (.zip)
+  // Download specific ready-to-deploy config & guide files directly from the repository
+  app.get('/api/deploy/repo-file', (req, res) => {
+    const file = (req.query.name as string) || '';
+    const ALLOWED_FILES: Record<string, string> = {
+      'wrangler.toml': 'wrangler.toml',
+      '_routes.json': '_routes.json',
+      'schema.sql': 'schema.sql',
+      'vercel.json': 'vercel.json',
+      'edgeone.json': 'edgeone.json',
+      'esa.jsonc': 'esa.jsonc',
+      'netlify.toml': 'netlify.toml',
+      'Dockerfile': 'Dockerfile',
+      'docker-compose.yml': 'docker-compose.yml',
+      'README.md': 'README.md',
+      'DEPLOYMENT.md': 'docs/DEPLOYMENT.md',
+    };
+    const rel = ALLOWED_FILES[file];
+    if (!rel) {
+      res.status(404).json({ error: '不支持的文件名' });
+      return;
+    }
+    const resolved = path.resolve(__dirname, rel);
+    if (!resolved.startsWith(__dirname + path.sep) || !fs.existsSync(resolved)) {
+      res.status(404).json({ error: '仓库内暂未找到该文件' });
+      return;
+    }
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${path.basename(rel)}"`);
+    res.sendFile(resolved);
+  });
+
+  // Downloadable Multi-Cloud Pages Upload Bundle (.zip: dist/ + _worker.js + edgeone.json + esa.jsonc + wrangler.toml + schema.sql)
   app.get('/api/deploy/pages-package.zip', async (_req, res) => {
     try {
       const zip = new JSZip();
@@ -2626,34 +3014,16 @@ async function createServer() {
         addDirToZip(path.join(__dirname, 'functions'), fnFolder);
       }
 
-      for (const cfgFile of ['_routes.json', 'wrangler.toml', 'schema.sql', 'README.md']) {
+      for (const cfgFile of ['_routes.json', 'wrangler.toml', 'edgeone.json', 'esa.jsonc', 'netlify.toml', 'schema.sql', 'README.md']) {
         const p = path.join(__dirname, cfgFile);
         if (fs.existsSync(p)) {
           zip.file(cfgFile, fs.readFileSync(p));
         }
       }
 
-      zip.file(
-        'DEPLOY_PAGES_GUIDE.txt',
-        [
-          'BCAI Cloudflare Pages 上传部署包说明',
-          '====================================',
-          '1. 网页直接上传（Dashboard Upload Assets）:',
-          '   本压缩包根目录已内置完整编译后的静态前端与 _worker.js 全栈边缘服务端。',
-          '   直接将本 .zip 文件上传到 Cloudflare Dashboard -> Workers & Pages -> Create -> Pages -> Upload assets 即可运行！',
-          '2. Wrangler CLI 上传:',
-          '   解压后在目录内执行: npx wrangler pages deploy . --project-name=bcai',
-          '3. 绑定 Workers AI、D1 数据库与 R2 存储桶:',
-          '   进入 Pages 项目 Settings -> Functions:',
-          '   - Workers AI Binding 变量名设为: AI',
-          '   - D1 Database Binding 变量名设为: DB (首次建表执行 npx wrangler d1 execute bcai-db --remote --file=./schema.sql)',
-          '   - R2 Bucket Binding 变量名设为: BUCKET',
-        ].join('\n')
-      );
-
       const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
       res.setHeader('Content-Type', 'application/zip');
-      res.setHeader('Content-Disposition', 'attachment; filename="bcai-cloudflare-pages-deploy.zip"');
+      res.setHeader('Content-Disposition', 'attachment; filename="bcai-pages-upload-bundle.zip"');
       res.send(buffer);
     } catch (err: any) {
       res.status(500).json({ error: `生成部署包失败: ${err?.message}` });

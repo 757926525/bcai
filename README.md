@@ -1,39 +1,63 @@
 # BCAI AI 工作台（AIMX 升级版）
 
-集 **AI 编程区**、**AI 绘图区（含负向提示词与完整参数区）**、**多模态图文/文件流式对话**、**Cloudflare D1 & R2/S3 存储桶双通道同步**、**GitHub / GitLab / Gitee 多仓库分支协同**、**主流网盘/邮箱/部署连接器** 与 **一键多平台部署** 于一体的开源全栈工作台。
+集 **AI 编程区**、**AI 绘图区（含负向提示词与完整参数区）**、**多模态图文/文件流式对话**、**多数据库（D1 / Turso / Supabase / Neon / Upstash）与多存储桶（R2 / 阿里云 OSS / 腾讯云 COS / S3 / MinIO）双通道同步**、**GitHub / GitLab / Gitee OAuth 与分支协同**、**连接器中心（支持对话直接存入代码）** 与 **多云 Pages 拉取/上传一键部署** 于一体的开源全栈工作台。
 
 默认开源目标仓库：`https://github.com/757926525/bcai`（支持界面实时修改并持久化保存）。
+
+> 完整图文与命令行运维步骤请查阅：[`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md)
 
 ---
 
 ## 核心功能亮点
 
-1. **编程区 & 绘图区双核心布局**
-   - **编程区**：代码高亮、块级复制、一键写入数据库、一键发送至 Git 仓库分支、回复内容一键打包为 `.zip`。
-   - **绘图区**：支持正向 Prompt + 独立**负向提示词（Negative Prompt）**窗口 + 常用排除词预设、步数（Steps）、CFG 引导系数、Seed 随机种子、自定义尺寸及中英自动翻译；支持保存至 D1 数据库或存储桶。
+1. **双区直观仓库授权（OAuth 授权 + 站点 ID ｜ 目标仓库地址与 Token 直连）**
+   - 支持 **GitHub / GitLab（含私有实例）/ Gitee 码云** 弹窗 OAuth 授权登录，并在界面内提供 **仓库站点 ID（OAuth Client ID / 部署站点 ID）** 配置与部署使用说明。
+   - 使用分隔线将「连接仓库站点（OAuth）」与「保存目标仓库地址和 Token 实现直连」清晰划分为两大区域，支持单文件读写、新建分支与整库原子推送。
 
-2. **多模态上传对话 & 聊天底部上拉功能条**
-   - 直接上传图片（PNG/JPG/WebP）与源代码/文档（`.ts/.tsx/.py/.md/.json/...`）进行图文/代码联合提问。
-   - **对话框底部工具条**：上传文件按钮、下载文件按钮、草稿板、暂停按钮统一位于输入区下方，互不遮挡。
-   - **可向上拉动 / 展开的扩展抽屉**：支持触摸上滑与点击展开，平时收起不拥挤；展开可管理附件、临时草稿板、以及打包下载 `.zip` / 多选合并导出对话 `.txt`。
+2. **多数据库 & 多对象存储桶自由切换**
+   - **数据库支持**：Cloudflare D1（原生 `env.DB` 与 HTTP API）、Turso / libSQL、Supabase PostgREST、Neon Serverless Postgres、Upstash Redis REST，以及本地 `.data/bcai-db.json` 回退。
+   - **存储桶支持**：Cloudflare R2、阿里云 OSS、腾讯云 COS、AWS S3、MinIO、Backblaze B2 / 七牛云（自动适配 Path / Virtual-Hosted 签名模式）。
+   - **手机端优化**：`(数据库 · 存储桶 · 同步历史)` 三灯状态栏位于侧边栏 **「新建会话」** 按键上方；会话 **「暂停/恢复」** 仅保留在顶部右上角，彻底释放手机端对话视野。
 
-3. **更多内置免费大模型 & 真实连接状态灯**
-   - **选区一（内置工作台 · CF Workers AI 免费优先）**：Llama 4 Scout / Maverick（支持看图）、Llama 3.3 70B、Llama 3.2 11B Vision、Qwen2.5 Coder 32B、Qwen2.5 72B、QwQ 32B、DeepSeek R1 32B、Gemma 3 12B、Mistral Small 3.1 24B、Granite 3.1 等。
-   - **选区二（免费扩展 & 外接自定义模型）**：Gemini（`gemini-4-hydrogen` / `gemini-3.1-flash-lite` / `gemini-2.5-flash`）、DeepSeek 开放平台、Groq Cloud（最高 14,400 RPD）、OpenRouter `:free`、GitHub Models、Cerebras、硅基流动，支持客户端直连 SSE 流式与自定义模型列表。
-   - 每个模型、数据库、存储桶、历史同步、连接器均配备**真实连接状态灯**。
+3. **连接器中心 & 对话直接存代码**
+   - 支持 Alist/阿里云盘、WebDAV、OneDrive、Google Drive、Resend 邮箱、Cloudflare/Vercel/Netlify 与自定义 Webhook。
+   - 连接器接入后，可在对话代码块点击 **「存入连接器」**，或直接在对话发送 `/save` / `/存入连接器` 指令将生成的代码直接写入网盘或推送至 Webhook。
 
-4. **6 款护眼与工程主题 + 手机/电脑一键切换**
-   - 内置 **CF 原生靛蓝（与 cloudflare-ai-web 同款）**、**深海石板**、**极光翠绿**、**暖砂纸墨**、**午夜极客**、**暮色紫罗兰** 6 款主题（均支持浅色/深色）。
-   - 顶部一键切换 **手机布局** 与 **电脑布局**，窄屏移动端零文字遮挡。
+4. **全站管理员登录拦截开关 & 分级权限**
+   - 支持在 **外接 API 与系统设置** 中一键开启/关闭 **全站访问限制（登录门禁）**：开启后未登录访客将被全屏登录界面阻挡，仅管理员可使用全部工作台能力。
 
-5. **默认免登录 + 管理员密码分级可见**
-   - 普通用户打开即用编程、绘图与文件对话，无强制登录墙。
-   - 管理员可使用后台环境变量 `ACCESS_PASSWORD` 或面板内自定义的管理员密码登录；登录后解锁 **仓库连接**、**数据库与文件 (D1 & 存储桶)**、**历史对话与同步**、**连接器中心**、**外接 API 与模型管理区**。
+5. **多云 Pages 拉取部署 & 仓库内置可下载部署文件**
+   - 仓库内直接提供 `edgeone.json`（腾讯云 EdgeOne Pages）、`esa.jsonc`（阿里云 ESA Pages）、`wrangler.toml` & `_routes.json`（Cloudflare Pages）、`netlify.toml`、`vercel.json`、`schema.sql` 与 `npm run build:pages` 打包脚本（输出可直接上传的 `dist-pages/`）。
 
-6. **存储桶 (R2/S3) + D1 HTTP API 自动建表 + 连接器**
-   - 独立运行时可直接填写 Cloudflare Account ID、D1 UUID、D1 Edit Token，自动执行建表 SQL。
-   - 支持 S3/R2 兼容对象存储桶，每条文件明确标注存储位置（`Cloudflare D1` / `存储桶 (R2/S3)` / `本地存储`），支持上传、下载与删除。
-   - **连接器中心**支持主流网盘（Alist/阿里云盘/WebDAV/OneDrive/Google Drive）、邮箱（Resend/SMTP）、部署平台（Cloudflare/Vercel/Netlify）等并支持实时探活。
+---
+
+## 快速部署方式汇总
+
+### 1. 腾讯云 EdgeOne Pages / 阿里云 ESA Pages / Cloudflare Pages 拉取部署
+- 将本仓库推送至 GitHub / GitLab / Gitee 后，在对应云平台导入仓库：
+  - **腾讯云 EdgeOne Pages**：自动读取 `edgeone.json`（构建命令 `npm run build:pages`，输出目录 `dist-pages`）。
+  - **阿里云 ESA Pages**：自动读取 `esa.jsonc`（构建命令 `npm run build:pages`，静态目录 `dist-pages`，边缘路由 `_worker.js`）。
+  - **Cloudflare Pages**：Framework 选择 `Vite`，构建命令 `npm run build`，输出目录 `dist`，并在 Functions 绑定 `AI` / `DB` / `BUCKET`。
+
+### 2. 上传 Pages 部署（直接生成可用文件）
+```bash
+npm ci
+npm run build:pages
+```
+命令执行完成后，根目录将生成 `dist-pages/` 文件夹（内含编译好的前端、`wrangler.toml`、`_routes.json`、`edgeone.json`、`esa.jsonc`、`netlify.toml`、`schema.sql` 以及打包好的 `_worker.js`），直接上传该目录或通过 `npx wrangler pages deploy dist-pages` 即可上线。也可在工作台「部署和使用 → 上传 Pages 部署」直接单独下载这些配置文件。
+
+### 3. Vercel / Docker / Linux VPS 部署
+```bash
+git clone https://github.com/757926525/bcai.git
+cd bcai
+cp .env.example .env
+# 方式 A：Docker Compose
+docker compose up -d --build
+
+# 方式 B：Node.js 22+ 原生运行
+npm ci && npm run build
+NODE_ENV=production node server.ts
+```
 
 ---
 
@@ -41,38 +65,17 @@
 
 | 变量名 | 说明 |
 | --- | --- |
-| `ACCESS_PASSWORD` | 后台预设管理员密码（设置后可直接登录管理区） |
+| `ACCESS_PASSWORD` | 管理员登录密码（设置后可直接登录管理区或通过登录门禁） |
+| `APP_URL` | 站点公网访问地址（用于 GitHub / GitLab / Gitee OAuth 回调） |
 | `TARGET_REPO_URL` | 自定义默认开源目标仓库（默认 `https://github.com/757926525/bcai`） |
 | `GEMINI_API_KEY` | Google Gemini 服务端密钥 |
-| `CF_ACCOUNT_ID` / `CF_API_TOKEN` | Cloudflare Workers AI 与 D1 HTTP API 凭证 |
-| `CF_D1_DATABASE_ID` | Cloudflare D1 数据库 UUID |
-| `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | Cloudflare R2 或 S3 兼容存储桶配置 |
-| `DEEPSEEK_API_KEY` / `GROQ_API_KEY` / `OPENROUTER_API_KEY` | 可选免费大模型平台环境变量 |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODELS` | 通用 OpenAI 兼容端点与自定义模型 |
-| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` / `GITHUB_TOKEN` | GitHub OAuth 或 PAT |
-| `GITLAB_TOKEN` / `GITEE_TOKEN` | GitLab 与 Gitee 访问令牌 |
-
----
-
-## 部署指南
-
-### 1. Cloudflare Pages 上传部署（Direct Upload）
-1. 点击界面左侧 **部署和使用 -> 下载 Pages 上传包 (.zip)**（或在本地执行 `npm run build` 后将 `dist/` 与打包后的 `_worker.js` 一起上传）。
-2. 在 Pages Settings -> Functions 绑定：`AI`（Workers AI）、`DB`（D1）、`BUCKET`（R2，可选）。
-3. 使用 `npx wrangler d1 execute bcai-db --remote --file=./schema.sql` 初始化 D1 表结构。
-
-### 2. Cloudflare Pages 拉取部署（Git Pull）
-- Framework preset：`Vite` | Build command：`npm run build` | Build output directory：`dist`
-
-### 3. Vercel / Docker / Linux VPS 部署
-```bash
-git clone https://github.com/757926525/bcai.git
-cd bcai
-cp .env.example .env
-npm ci && npm run build
-NODE_ENV=production node server.ts
-```
-或直接使用 Docker Compose：
-```bash
-docker compose up -d --build
-```
+| `CF_ACCOUNT_ID` / `CF_API_TOKEN` / `CF_D1_DATABASE_ID` | Cloudflare Workers AI 与 D1 HTTP API 凭证 |
+| `TURSO_URL` / `TURSO_AUTH_TOKEN` | Turso / libSQL 远程数据库 |
+| `SUPABASE_URL` / `SUPABASE_KEY` | Supabase PostgREST 数据库 |
+| `NEON_CONNECTION_STRING` | Neon Serverless Postgres 连接串 |
+| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis REST 数据库 |
+| `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_ADDRESSING_STYLE` | R2 / 阿里云 OSS / 腾讯云 COS / AWS S3 / MinIO 对象存储配置 |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` / `GITHUB_TOKEN` | GitHub OAuth 应用凭证或 PAT |
+| `GITLAB_CLIENT_ID` / `GITLAB_CLIENT_SECRET` / `GITLAB_TOKEN` | GitLab OAuth 应用凭证或 PAT |
+| `GITEE_CLIENT_ID` / `GITEE_CLIENT_SECRET` / `GITEE_TOKEN` | Gitee 码云 OAuth 应用凭证或 PAT |
+| `DEEPSEEK_API_KEY` / `GROQ_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` | 免费及外接大模型 API Key |

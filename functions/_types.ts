@@ -41,11 +41,20 @@ export interface CFEnv {
   CF_ACCOUNT_ID?: string;
   CF_API_TOKEN?: string;
   CF_D1_DATABASE_ID?: string;
+  DB_PROVIDER?: string;
+  TURSO_URL?: string;
+  TURSO_AUTH_TOKEN?: string;
+  SUPABASE_URL?: string;
+  SUPABASE_KEY?: string;
+  NEON_CONNECTION_STRING?: string;
+  UPSTASH_REDIS_REST_URL?: string;
+  UPSTASH_REDIS_REST_TOKEN?: string;
   S3_ENDPOINT?: string;
   S3_REGION?: string;
   S3_BUCKET?: string;
   S3_ACCESS_KEY_ID?: string;
   S3_SECRET_ACCESS_KEY?: string;
+  S3_ADDRESSING_STYLE?: string;
   DEEPSEEK_API_KEY?: string;
   DEEPSEEK_BASE_URL?: string;
   GROQ_API_KEY?: string;
@@ -57,7 +66,11 @@ export interface CFEnv {
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
   GITHUB_TOKEN?: string;
+  GITLAB_CLIENT_ID?: string;
+  GITLAB_CLIENT_SECRET?: string;
   GITLAB_TOKEN?: string;
+  GITEE_CLIENT_ID?: string;
+  GITEE_CLIENT_SECRET?: string;
   GITEE_TOKEN?: string;
   TARGET_REPO_URL?: string;
   APP_URL?: string;
@@ -69,7 +82,5 @@ export interface PagesContext {
 }
 
 export function checkAccess(_request: Request, _env: CFEnv): Response | null {
-  // 默认无登录阻挡：公开用户可直接进入对话、编程与绘图工作区；
-  // 管理员区（数据库、外接API、仓库、连接器）由管理员会话接口单独校验。
   return null;
 }

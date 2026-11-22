@@ -4,6 +4,7 @@ export interface S3Config {
   bucket: string;
   accessKeyId: string;
   secretAccessKey: string;
+  addressingStyle?: 'path' | 'virtual';
 }
 
 export interface S3ObjectSummary {
@@ -67,6 +68,45 @@ function encodeS3Path(key: string): string {
     .join('/');
 }
 
+function resolveS3Target(cfg: S3Config, objectKey: string): { targetOrigin: string; hostHeader: string; fullPath: string } {
+  const cleanEndpoint = cfg.endpoint.trim().replace(/\/+$/, '');
+  const base = new URL(cleanEndpoint);
+  const bucket = cfg.bucket.trim();
+  const keyPath = objectKey ? `/${encodeS3Path(objectKey)}` : '';
+  const basePath = base.pathname.replace(/\/+$/, '');
+
+  const hostLower = base.hostname.toLowerCase();
+  const alreadyVirtual = hostLower.startsWith(`${bucket.toLowerCase()}.`);
+  const needsVirtual =
+    cfg.addressingStyle === 'virtual' ||
+    (!cfg.addressingStyle && (hostLower.includes('aliyuncs.com') || hostLower.includes('myqcloud.com')));
+
+  if (alreadyVirtual) {
+    return {
+      targetOrigin: base.origin,
+      hostHeader: base.host,
+      fullPath: `${basePath}${keyPath}` || '/',
+    };
+  }
+
+  if (needsVirtual) {
+    const portSuffix = base.port ? `:${base.port}` : '';
+    const vHost = `${bucket}.${base.hostname}${portSuffix}`;
+    return {
+      targetOrigin: `${base.protocol}//${vHost}`,
+      hostHeader: vHost,
+      fullPath: `${basePath}${keyPath}` || '/',
+    };
+  }
+
+  const bucketPrefix = `/${encodeRfc3986(bucket)}`;
+  return {
+    targetOrigin: base.origin,
+    hostHeader: base.host,
+    fullPath: `${basePath}${bucketPrefix}${keyPath}` || '/',
+  };
+}
+
 async function signedS3Fetch(
   cfg: S3Config,
   method: 'GET' | 'PUT' | 'DELETE' | 'HEAD',
@@ -75,18 +115,13 @@ async function signedS3Fetch(
   body?: Uint8Array | string,
   contentType?: string
 ): Promise<Response> {
-  const cleanEndpoint = cfg.endpoint.trim().replace(/\/+$/, '');
-  const base = new URL(cleanEndpoint);
+  const { targetOrigin, hostHeader, fullPath } = resolveS3Target(cfg, objectKey);
   const region = (cfg.region || 'auto').trim();
   const service = 's3';
 
   const now = new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
   const dateStamp = amzDate.slice(0, 8);
-
-  const keyPath = objectKey ? `/${encodeS3Path(objectKey)}` : '';
-  const bucketPrefix = `/${encodeRfc3986(cfg.bucket.trim())}`;
-  const fullPath = `${base.pathname.replace(/\/+$/, '')}${bucketPrefix}${keyPath}`;
 
   const queryKeys = Object.keys(queryParams).sort();
   const canonicalQuery = queryKeys
@@ -98,7 +133,7 @@ async function signedS3Fetch(
   const payloadHash = await sha256Hex(payloadBytes);
 
   const headersToSign: Record<string, string> = {
-    host: base.host,
+    host: hostHeader,
     'x-amz-content-sha256': payloadHash,
     'x-amz-date': amzDate,
   };
@@ -135,7 +170,7 @@ async function signedS3Fetch(
 
   const authorization = `AWS4-HMAC-SHA256 Credential=${cfg.accessKeyId.trim()}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${sigHex}`;
 
-  const targetUrl = `${base.origin}${fullPath}${canonicalQuery ? `?${canonicalQuery}` : ''}`;
+  const targetUrl = `${targetOrigin}${fullPath}${canonicalQuery ? `?${canonicalQuery}` : ''}`;
   const fetchHeaders: Record<string, string> = {
     'x-amz-content-sha256': payloadHash,
     'x-amz-date': amzDate,

@@ -12,12 +12,15 @@ import {
   MessageSquare,
   Moon,
   Palette,
+  Pause,
+  Play,
   Plug,
   Plus,
   Rocket,
   Settings,
   ShieldCheck,
   Smartphone,
+  Square,
   Sun,
   Trash2,
   X,
@@ -42,6 +45,7 @@ import { probeProviderConnection, streamChatCompletion } from './services/stream
 import {
   BucketStatusInfo,
   ChatAttachment,
+  ConnectorItem,
   Conversation,
   DbStatusInfo,
   ExternalProvider,
@@ -67,7 +71,6 @@ const LS_THEME_DARK = 'bcai.dark.v3';
 const LS_THEME_ID = 'bcai.themeId.v3';
 const LS_LAYOUT_MODE = 'bcai.layoutMode.v3';
 const LS_TARGET_REPO = 'bcai.targetRepo.v3';
-const LS_ADMIN_TOKEN = 'bcai.adminToken.v3';
 
 function parseRepoSlug(urlOrSlug: string): string {
   const clean = (urlOrSlug || '').trim().replace(/\/+$/, '');
@@ -145,22 +148,29 @@ export default function App() {
     saveLocalJson(LS_LAYOUT_MODE, layoutMode);
   }, [layoutMode]);
 
-  // Admin Session & Token Interceptor for same-origin /api/*
-  const [adminToken, setAdminToken] = useState<string>(() => loadLocalJson<string>(LS_ADMIN_TOKEN, ''));
+  // Admin Session (HttpOnly/Partitioned cookie primary + in-memory fallback, never persisted in localStorage)
+  const [adminToken, setAdminToken] = useState<string>('');
   const [isAdmin, setIsAdmin] = useState<boolean>(false);
 
   useEffect(() => {
-    saveLocalJson(LS_ADMIN_TOKEN, adminToken);
-  }, [adminToken]);
+    try {
+      localStorage.removeItem('bcai.adminToken.v3');
+    } catch {
+      // ignore
+    }
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const origFetch = window.fetch.bind(window);
     window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-      if (url.startsWith('/api/') && adminToken) {
+      if (url.startsWith('/api/')) {
         const headers = new Headers(init?.headers || (input instanceof Request ? input.headers : undefined));
-        if (!headers.has('x-admin-token')) {
+        if (!headers.has('x-requested-with')) {
+          headers.set('X-Requested-With', 'XMLHttpRequest');
+        }
+        if (adminToken && !headers.has('x-admin-token')) {
           headers.set('x-admin-token', adminToken);
         }
         return origFetch(input, { ...init, headers });
@@ -283,6 +293,10 @@ export default function App() {
   const [deployModalOpen, setDeployModalOpen] = useState(false);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [pendingRepoCode, setPendingRepoCode] = useState<{ code: string; lang: string } | null>(null);
+  const [connectors, setConnectors] = useState<ConnectorItem[]>([]);
+  const [gatePw, setGatePw] = useState('');
+  const [gateErr, setGateErr] = useState('');
+  const [gateLoading, setGateLoading] = useState(false);
   const [toastMsg, setToastMsg] = useState<string>('');
 
   const showToast = useCallback((msg: string) => {
@@ -293,6 +307,22 @@ export default function App() {
   // Streaming control
   const [isStreaming, setIsStreaming] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+
+  const refreshConnectors = useCallback(async () => {
+    if (!isAdmin) {
+      setConnectors([]);
+      return;
+    }
+    try {
+      const res = await fetch('/api/connectors');
+      if (res.ok) {
+        const data = (await res.json()) as { items?: ConnectorItem[] };
+        setConnectors(data.items || []);
+      }
+    } catch {
+      // ignore
+    }
+  }, [isAdmin]);
 
   const refreshStorageStatuses = useCallback(async () => {
     if (!isAdmin) return;
@@ -358,6 +388,7 @@ export default function App() {
       return;
     }
     refreshStorageStatuses();
+    refreshConnectors();
     (async () => {
       try {
         const r = await fetch(
@@ -373,7 +404,13 @@ export default function App() {
         // ignore
       }
     })();
-  }, [isAdmin, gitState.provider, gitState.hostUrl, refreshStorageStatuses]);
+  }, [isAdmin, gitState.provider, gitState.hostUrl, refreshStorageStatuses, refreshConnectors]);
+
+  useEffect(() => {
+    if (isAdmin && mode !== 'connectors') {
+      refreshConnectors();
+    }
+  }, [isAdmin, mode, refreshConnectors]);
 
   // Probe single provider
   const handleProbeProvider = useCallback(async (provider: ExternalProvider) => {
@@ -402,7 +439,7 @@ export default function App() {
     handleProbeAll();
   }, []);
 
-  // Listen for GitHub OAuth popup postMessage
+  // Listen for Multi-Git OAuth popup postMessage
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
       const origin = event.origin;
@@ -413,15 +450,17 @@ export default function App() {
       ) {
         return;
       }
-      if (event.data?.type === 'OAUTH_AUTH_SUCCESS' && event.data?.provider === 'github') {
+      const p = event.data?.provider as GitProviderType | undefined;
+      if (event.data?.type === 'OAUTH_AUTH_SUCCESS' && (p === 'github' || p === 'gitlab' || p === 'gitee')) {
+        const defaultHost = p === 'gitlab' ? 'https://gitlab.com' : p === 'gitee' ? 'https://gitee.com' : 'https://github.com';
         setGitState((prev) => ({
           ...prev,
-          provider: 'github',
-          hostUrl: 'https://github.com',
+          provider: p,
+          hostUrl: event.data.hostUrl || defaultHost,
           user: event.data.user || prev.user,
           token: event.data.token || prev.token,
         }));
-        showToast(`GitHub 已授权登录：${event.data.user?.login || '成功'}`);
+        showToast(`${p.toUpperCase()} 已授权登录：${event.data.user?.login || '成功'}`);
       }
     };
     window.addEventListener('message', onMessage);
@@ -852,19 +891,115 @@ export default function App() {
     }
   };
 
-  // Multi-Git Actions
-  const handleGitHubOAuth = async () => {
+  // Login Gate & Connector Code Save Handlers
+  const handleToggleLoginGate = async (enabled: boolean) => {
+    const res = await fetch('/api/auth/login-gate', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    const data = (await res.json()) as { ok?: boolean; requireLoginGate?: boolean; message?: string; error?: string };
+    if (!res.ok) {
+      showToast(data.error || '切换全站登录门禁失败');
+      throw new Error(data.error || '切换全站登录门禁失败');
+    }
+    setPublicConfig((prev) => (prev ? { ...prev, requireLoginGate: Boolean(data.requireLoginGate) } : prev));
+    showToast(data.message || (enabled ? '已开启全站访问限制' : '已关闭全站访问限制'));
+  };
+
+  const handleGateLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setGateErr('');
+    setGateLoading(true);
     try {
-      const res = await fetch('/api/auth/github/url');
+      const res = await fetch('/api/auth/admin-login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ password: gatePw }),
+      });
+      const data = (await res.json()) as { adminToken?: string; error?: string };
+      if (!res.ok) {
+        setGateErr(data.error || '管理员密码验证失败');
+        return;
+      }
+      setAdminToken(data.adminToken || '');
+      setIsAdmin(true);
+      setGatePw('');
+      setGateErr('');
+      showToast('管理员已登录，工作台已解锁');
+      loadConfigAndAuth();
+    } catch {
+      setGateErr('网络异常，无法连接鉴权服务');
+    } finally {
+      setGateLoading(false);
+    }
+  };
+
+  const handleSaveCodeToConnector = async (
+    connectorId: string,
+    filename: string,
+    targetDir: string,
+    code: string,
+    lang: string
+  ): Promise<{ message: string }> => {
+    const res = await fetch('/api/connectors/save-code', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        connectorId,
+        filename,
+        targetDir,
+        code,
+        lang,
+        conversationTitle: activeConv?.title || '',
+        connector: connectors.find((c) => c.id === connectorId),
+      }),
+    });
+    const data = (await res.json()) as { message?: string; error?: string };
+    if (!res.ok) {
+      throw new Error(data.error || '写入连接器失败');
+    }
+    const msg = data.message || '代码已存入连接器';
+    showToast(msg);
+    return { message: msg };
+  };
+
+  const handleAppendLocalExchange = (userText: string, assistantText: string) => {
+    if (!activeConv) return;
+    const now = new Date().toISOString();
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.id === activeConv.id
+          ? {
+              ...c,
+              title: c.messages.length === 0 ? userText.slice(0, 26) : c.title,
+              updatedAt: now,
+              messages: [
+                ...c.messages,
+                { id: uid(), role: 'user', content: userText, createdAt: now },
+                { id: uid(), role: 'assistant', content: assistantText, createdAt: now },
+              ],
+            }
+          : c
+      )
+    );
+  };
+
+  // Multi-Git Actions
+  const handleGitOAuth = async (provider: GitProviderType, hostUrl: string) => {
+    try {
+      const res = await fetch(
+        `/api/auth/git/url?provider=${encodeURIComponent(provider)}&hostUrl=${encodeURIComponent(hostUrl)}`
+      );
       const data = (await res.json()) as { url?: string; error?: string };
       if (!res.ok || !data.url) {
-        showToast(data.error || '请填写 Access Token 连接仓库');
+        showToast(data.error || `请先在下方填写 ${provider.toUpperCase()} OAuth Client ID/Secret 或使用 Access Token 连接`);
         setMode('repo');
         return;
       }
-      window.open(data.url, 'github_oauth_popup', 'width=620,height=720');
+      window.open(data.url, 'git_oauth_popup', 'width=640,height=740');
     } catch {
-      showToast('发起 GitHub OAuth 授权失败');
+      showToast(`发起 ${provider.toUpperCase()} OAuth 授权失败`);
     }
   };
 
@@ -981,6 +1116,75 @@ export default function App() {
   // Mobile-simulation outer frame when user manually picks 'mobile' on desktop
   const forcedMobileShell = layoutMode === 'mobile' && windowWidth >= 768;
 
+  // Site-wide Admin Login Gate: block entire workspace when enabled & not admin
+  if (publicConfig?.requireLoginGate && !isAdmin) {
+    return (
+      <div className="min-h-dvh w-full wb-bg wb-ink flex flex-col items-center justify-center p-4">
+        <div className="w-full max-w-md rounded-2xl border wb-border wb-panel shadow-xl p-6 sm:p-7 space-y-5">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="w-11 h-11 rounded-xl wb-tint flex items-center justify-center shrink-0">
+                <Lock className="w-5 h-5 wb-accent-text" />
+              </div>
+              <div>
+                <h1 className="font-display text-lg font-bold wb-ink">BCAI 工作台 · 管理员访问门禁</h1>
+                <p className="text-xs wb-muted mt-0.5">管理员已开启全站登录限制</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setDark((d) => !d)}
+              className="w-9 h-9 rounded-lg border wb-border flex items-center justify-center wb-ink hover:opacity-80 shrink-0"
+              aria-label="切换明暗主题"
+            >
+              {dark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+            </button>
+          </div>
+
+          <div className="rounded-xl border wb-border wb-bg p-3.5 text-xs wb-muted leading-relaxed">
+            当前站点已开启<strong className="wb-ink">「仅管理员可使用全部功能」</strong>保护策略。请使用后台环境变量{' '}
+            <code className="font-mono">ACCESS_PASSWORD</code> 或已设置的管理员密码登录解锁。
+          </div>
+
+          <form onSubmit={handleGateLogin} className="space-y-3">
+            <label className="flex flex-col gap-1.5 text-xs wb-muted">
+              <span>管理员密码</span>
+              <input
+                type="password"
+                autoFocus
+                value={gatePw}
+                onChange={(e) => setGatePw(e.target.value)}
+                placeholder={
+                  publicConfig.hasAdminPassword
+                    ? '输入 ACCESS_PASSWORD 或管理员自设密码'
+                    : '首次登录可直接输入并设定管理员密码'
+                }
+                className="h-11 px-3 rounded-lg border wb-border wb-bg wb-ink text-sm"
+              />
+            </label>
+
+            {gateErr && <div className="text-xs text-red-600 dark:text-red-400">{gateErr}</div>}
+
+            <button
+              type="submit"
+              disabled={gateLoading}
+              className="w-full h-11 rounded-lg wb-accent text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50"
+            >
+              <ShieldCheck className="w-4 h-4" />
+              <span>{gateLoading ? '正在验证...' : '登录管理员并进入工作台'}</span>
+            </button>
+          </form>
+        </div>
+
+        {toastMsg && (
+          <div className="fixed bottom-4 right-4 z-50 px-4 py-2.5 rounded-lg border wb-border wb-panel shadow-lg text-xs font-medium wb-ink max-w-[90vw]">
+            {toastMsg}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="h-dvh w-full wb-bg wb-ink overflow-hidden flex justify-center">
       <div
@@ -1025,6 +1229,84 @@ export default function App() {
               </button>
             )}
           </div>
+
+          {/* Admin Real-Time Storage & Sync Status Panel (Moved Above New Conversation for Mobile UX) */}
+          {isAdmin && (
+            <div className="mx-3 mt-3 p-2.5 rounded-xl border wb-border wb-bg space-y-1.5 text-[11px]">
+              <div className="flex items-center justify-between gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDbDrawerOpen(true);
+                    setSidebarOpen(false);
+                  }}
+                  className="inline-flex items-center gap-1.5 wb-ink hover:wb-accent-text min-w-0"
+                  title="查看与配置云端数据库"
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full shrink-0 ${
+                      dbStatus.connected ? 'bg-emerald-600' : dbStatus.d1Bound ? 'bg-red-600' : 'bg-amber-500'
+                    }`}
+                  />
+                  <span className="truncate">
+                    数据库：{dbStatus.connected ? (dbStatus.provider ? `${dbStatus.provider}已连` : '已连通') : dbStatus.d1Bound ? '异常' : '本地回退'}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDbDrawerOpen(true);
+                    setSidebarOpen(false);
+                  }}
+                  className="inline-flex items-center gap-1.5 wb-ink hover:wb-accent-text min-w-0"
+                  title="查看与配置对象存储桶"
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full shrink-0 ${
+                      bucketStatus.connected ? 'bg-emerald-600' : bucketStatus.configured ? 'bg-red-600' : 'bg-slate-400'
+                    }`}
+                  />
+                  <span className="truncate">
+                    存储桶：{bucketStatus.connected ? '已连' : bucketStatus.configured ? '异常' : '未配置'}
+                  </span>
+                </button>
+              </div>
+
+              <div className="pt-1 border-t wb-border flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleSyncConversations('auto')}
+                  className="inline-flex items-center gap-1.5 wb-ink hover:wb-accent-text"
+                  title="点击立即同步全部对话到已绑定的数据库 / 存储桶"
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full shrink-0 ${
+                      syncStatus.status === 'success'
+                        ? 'bg-emerald-600'
+                        : syncStatus.status === 'syncing'
+                        ? 'bg-amber-500 animate-pulse'
+                        : syncStatus.status === 'error'
+                        ? 'bg-red-600'
+                        : 'bg-slate-400'
+                    }`}
+                  />
+                  <span>
+                    {syncStatus.status === 'success'
+                      ? '同步历史：已成功'
+                      : syncStatus.status === 'syncing'
+                      ? '同步历史：进行中…'
+                      : syncStatus.status === 'error'
+                      ? '同步历史：失败'
+                      : '同步历史：点击同步'}
+                  </span>
+                </button>
+                <span className="font-mono text-[10px] wb-muted truncate max-w-[92px]" title={targetRepoUrl}>
+                  {gitState.repo.split('/')[1] || gitState.repo}
+                </span>
+              </div>
+            </div>
+          )}
 
           <div className="p-3 flex gap-2">
             <button
@@ -1323,6 +1605,33 @@ export default function App() {
                 />
               )}
 
+              {/* Pause / Resume Session Button (Top-Right Corner Only, Saves Vertical Space on Mobile) */}
+              {activeConv && (mode === 'code' || mode === 'chat' || (mode === 'repo' && repoSubView === 'chat')) && (
+                <button
+                  type="button"
+                  onClick={handleTogglePauseSession}
+                  className={`h-9 sm:h-10 px-2 sm:px-2.5 rounded-lg border text-xs font-medium inline-flex items-center gap-1 whitespace-nowrap shrink-0 ${
+                    isStreaming
+                      ? 'border-red-500/40 bg-red-600 text-white hover:bg-red-700'
+                      : activeConv.status === 'paused'
+                      ? 'border-emerald-500/50 wb-tint text-emerald-700 dark:text-emerald-300'
+                      : 'wb-border wb-ink hover:opacity-80'
+                  }`}
+                  title={isStreaming ? '停止输出并暂停会话' : activeConv.status === 'paused' ? '恢复当前会话' : '暂停当前会话'}
+                >
+                  {isStreaming ? (
+                    <Square className="w-3.5 h-3.5" />
+                  ) : activeConv.status === 'paused' ? (
+                    <Play className="w-3.5 h-3.5" />
+                  ) : (
+                    <Pause className="w-3.5 h-3.5" />
+                  )}
+                  <span className="hidden sm:inline">
+                    {isStreaming ? '停止' : activeConv.status === 'paused' ? '恢复会话' : '暂停会话'}
+                  </span>
+                </button>
+              )}
+
               {/* 1-Click Mobile / Desktop Layout Switch */}
               <button
                 type="button"
@@ -1375,71 +1684,6 @@ export default function App() {
             </div>
           </header>
 
-          {/* Admin Real-Time Storage & Sync Status Lights Bar */}
-          {isAdmin && (
-            <div className="px-3 sm:px-4 py-1.5 border-b wb-border wb-bg flex items-center justify-between gap-3 text-[11px] overflow-x-auto no-scrollbar shrink-0">
-              <div className="flex items-center gap-3 sm:gap-4 whitespace-nowrap">
-                <button
-                  type="button"
-                  onClick={() => setDbDrawerOpen(true)}
-                  className="inline-flex items-center gap-1.5 wb-ink hover:wb-accent-text"
-                >
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      dbStatus.connected ? 'bg-emerald-600' : dbStatus.d1Bound ? 'bg-red-600' : 'bg-amber-500'
-                    }`}
-                  />
-                  <span>数据库：{dbStatus.connected ? 'D1已连通' : dbStatus.d1Bound ? '异常' : '本地回退'}</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setDbDrawerOpen(true)}
-                  className="inline-flex items-center gap-1.5 wb-ink hover:wb-accent-text"
-                >
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      bucketStatus.connected ? 'bg-emerald-600' : bucketStatus.configured ? 'bg-red-600' : 'bg-slate-400'
-                    }`}
-                  />
-                  <span>存储桶：{bucketStatus.connected ? '已连通' : bucketStatus.configured ? '异常' : '未配置'}</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => handleSyncConversations('auto')}
-                  className="inline-flex items-center gap-1.5 wb-ink hover:wb-accent-text"
-                  title="点击立即同步全部对话到已绑定的 D1 / 存储桶"
-                >
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      syncStatus.status === 'success'
-                        ? 'bg-emerald-600'
-                        : syncStatus.status === 'syncing'
-                        ? 'bg-amber-500 animate-pulse'
-                        : syncStatus.status === 'error'
-                        ? 'bg-red-600'
-                        : 'bg-slate-400'
-                    }`}
-                  />
-                  <span>
-                    {syncStatus.status === 'success'
-                      ? '历史同步成功'
-                      : syncStatus.status === 'syncing'
-                      ? '同步中…'
-                      : syncStatus.status === 'error'
-                      ? '同步失败'
-                      : '点击同步历史'}
-                  </span>
-                </button>
-              </div>
-
-              <span className="hidden md:inline font-mono wb-muted truncate">
-                目标仓库: {targetRepoUrl}
-              </span>
-            </div>
-          )}
-
           {/* Active Viewport */}
           {mode === 'image' ? (
             <ImageWorkspace
@@ -1457,6 +1701,7 @@ export default function App() {
               gitUser={gitState.user}
               gitToken={gitState.token}
               oauthConfigured={Boolean(publicConfig?.githubOAuthConfigured)}
+              oauthProviders={publicConfig?.gitOAuthProviders}
               appUrl={publicConfig?.appUrl || (typeof window !== 'undefined' ? window.location.origin : '')}
               targetRepoUrl={targetRepoUrl}
               selectedRepo={gitState.repo}
@@ -1464,7 +1709,7 @@ export default function App() {
               onChangeProvider={(provider, hostUrl) => setGitState((prev) => ({ ...prev, provider, hostUrl, user: null, token: '' }))}
               onSaveTargetRepoUrl={handleSaveTargetRepoUrl}
               onChangeRepoBranch={(repo, branch) => setGitState((prev) => ({ ...prev, repo, branch }))}
-              onOAuthConnect={handleGitHubOAuth}
+              onOAuthConnect={handleGitOAuth}
               onTokenConnect={handleGitTokenConnect}
               onDisconnect={handleGitDisconnect}
               onStartRepoChat={handleStartRepoChat}
@@ -1493,6 +1738,7 @@ export default function App() {
                 isStreaming={isStreaming}
                 isAdmin={isAdmin}
                 isMobileLayout={isMobileLayout}
+                connectors={connectors}
                 onSend={handleSendMessage}
                 onStopStream={() => abortRef.current?.abort()}
                 onTogglePauseSession={handleTogglePauseSession}
@@ -1511,8 +1757,11 @@ export default function App() {
                   setPendingRepoCode({ code, lang });
                   setRepoSubView('browser');
                 }}
+                onSaveCodeToConnector={handleSaveCodeToConnector}
+                onAppendLocalExchange={handleAppendLocalExchange}
                 repoConnected={Boolean(gitState.user)}
                 onOpenRepoTab={() => setRepoSubView('browser')}
+                onOpenConnectorsTab={() => handleSwitchMode('connectors')}
                 onOpenExportModal={() => setExportModalOpen(true)}
                 onShowToast={showToast}
               />
@@ -1527,6 +1776,7 @@ export default function App() {
                 isStreaming={isStreaming}
                 isAdmin={isAdmin}
                 isMobileLayout={isMobileLayout}
+                connectors={connectors}
                 onSend={handleSendMessage}
                 onStopStream={() => abortRef.current?.abort()}
                 onTogglePauseSession={handleTogglePauseSession}
@@ -1546,11 +1796,14 @@ export default function App() {
                   setMode('repo');
                   setRepoSubView('browser');
                 }}
+                onSaveCodeToConnector={handleSaveCodeToConnector}
+                onAppendLocalExchange={handleAppendLocalExchange}
                 repoConnected={Boolean(gitState.user)}
                 onOpenRepoTab={() => {
                   setMode('repo');
                   setRepoSubView('browser');
                 }}
+                onOpenConnectorsTab={() => handleSwitchMode('connectors')}
                 onOpenExportModal={() => setExportModalOpen(true)}
                 onShowToast={showToast}
               />
@@ -1597,6 +1850,8 @@ export default function App() {
         initialTab={settingsTab}
         onClose={() => setSettingsModalOpen(false)}
         isAdmin={isAdmin}
+        requireLoginGate={Boolean(publicConfig?.requireLoginGate)}
+        onToggleLoginGate={handleToggleLoginGate}
         providers={providers}
         providerStatuses={providerStatuses}
         publicConfig={publicConfig}

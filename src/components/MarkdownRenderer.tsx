@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
-import { Check, Copy, Database, GitBranch } from 'lucide-react';
+import { Check, Copy, Database, GitBranch, Plug } from 'lucide-react';
 
 interface MarkdownRendererProps {
   content: string;
   onSaveCodeToDb?: (code: string, lang: string) => void;
   onSendCodeToRepo?: (code: string, lang: string) => void;
+  onSaveCodeToConnector?: (code: string, lang: string) => void;
   repoConnected?: boolean;
 }
 
@@ -103,8 +104,9 @@ const CodeBlock: React.FC<{
   code: string;
   onSaveCodeToDb?: (code: string, lang: string) => void;
   onSendCodeToRepo?: (code: string, lang: string) => void;
+  onSaveCodeToConnector?: (code: string, lang: string) => void;
   repoConnected?: boolean;
-}> = ({ lang, code, onSaveCodeToDb, onSendCodeToRepo, repoConnected }) => {
+}> = ({ lang, code, onSaveCodeToDb, onSendCodeToRepo, onSaveCodeToConnector, repoConnected }) => {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = () => {
@@ -141,6 +143,17 @@ const CodeBlock: React.FC<{
               <span>推送到仓库</span>
             </button>
           )}
+          {onSaveCodeToConnector && (
+            <button
+              type="button"
+              onClick={() => onSaveCodeToConnector(code, lang)}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-slate-200/70 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition-colors whitespace-nowrap shrink-0"
+              title="将代码保存到已连接的连接器（网盘/邮箱/Webhook）"
+            >
+              <Plug className="w-3.5 h-3.5" />
+              <span>存入连接器</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={handleCopy}
@@ -162,6 +175,7 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
   content,
   onSaveCodeToDb,
   onSendCodeToRepo,
+  onSaveCodeToConnector,
   repoConnected,
 }) => {
   if (!content) {
@@ -193,6 +207,7 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
               code={seg.code}
               onSaveCodeToDb={onSaveCodeToDb}
               onSendCodeToRepo={onSendCodeToRepo}
+              onSaveCodeToConnector={onSaveCodeToConnector}
               repoConnected={repoConnected}
             />
           );
