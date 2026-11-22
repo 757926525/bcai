@@ -601,7 +601,7 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
       if (body.providerType === 'gemini') {
         const key = (body.source === 'custom' && body.apiKey) || env.GEMINI_API_KEY || '';
         if (!key || key === 'MY_GEMINI_API_KEY') return jsonRes({ status: 'unconfigured', message: '未配置 GEMINI_API_KEY' });
-        const probeModel = body.modelId || 'gemini-3.1-flash-lite';
+        const probeModel = body.modelId === 'gemini-2.5-flash' ? 'gemini-3.1-flash-lite' : (body.modelId || 'gemini-3.1-flash-lite');
         const r = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(probeModel)}?key=${encodeURIComponent(key)}`
         );
@@ -679,35 +679,56 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
     if (providerType === 'gemini') {
       const key = (source === 'custom' && apiKey) || env.GEMINI_API_KEY || '';
       if (!key) return jsonRes({ error: '未配置 GEMINI_API_KEY' }, 400);
+      let effectiveModel = model === 'gemini-2.5-flash' ? 'gemini-4-hydrogen' : model;
       const sys = messages.find((m) => m.role === 'system')?.content;
-      const contents = messages
-        .filter((m) => m.role !== 'system')
-        .map((m) => {
-          const parts: any[] = [];
-          let text = m.content || '';
-          const files = (m.attachments || []).filter((a) => a.kind === 'file' && a.textContent);
-          if (files.length > 0) {
-            text += files.map((f) => `\n\n[附带文件: ${f.name}]\n\`\`\`\n${String(f.textContent || '').slice(0, 24000)}\n\`\`\``).join('');
-          }
-          if (text) parts.push({ text });
-          const imgs = (m.attachments || []).filter((a) => a.kind === 'image' && a.dataUrl);
-          for (const img of imgs) {
-            const match = String(img.dataUrl || '').match(/^data:([^;]+);base64,(.+)$/);
-            if (match) parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
-          }
-          if (parts.length === 0) parts.push({ text: '' });
-          return { role: m.role === 'assistant' ? 'model' : 'user', parts };
-        });
+      const contents: Array<{ role: string; parts: any[] }> = [];
+      for (const m of messages) {
+        if (m.role === 'system') continue;
+        const role = m.role === 'assistant' ? 'model' : 'user';
+        const parts: any[] = [];
+        let text = m.content || '';
+        const files = (m.attachments || []).filter((a) => a.kind === 'file' && a.textContent);
+        if (files.length > 0) {
+          text += files.map((f) => `\n\n[附带文件: ${f.name}]\n\`\`\`\n${String(f.textContent || '').slice(0, 24000)}\n\`\`\``).join('');
+        }
+        if (text) parts.push({ text });
+        const imgs = (m.attachments || []).filter((a) => a.kind === 'image' && a.dataUrl);
+        for (const img of imgs) {
+          const match = String(img.dataUrl || '').match(/^data:([^;]+);base64,(.+)$/);
+          if (match) parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+        }
+        if (parts.length === 0) continue;
+        if (contents.length === 0 && role === 'model') {
+          contents.push({ role: 'user', parts: [{ text: '请继续。' }] });
+        }
+        const prev = contents[contents.length - 1];
+        if (prev && prev.role === role) prev.parts.push(...parts);
+        else contents.push({ role, parts });
+      }
+      if (contents.length === 0) contents.push({ role: 'user', parts: [{ text: '你好' }] });
 
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`;
-      const upstream = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          contents,
-          ...(sys ? { systemInstruction: { parts: [{ text: sys }] } } : {}),
-        }),
-      });
+      const callGeminiEdge = async (targetModel: string) => {
+        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(targetModel)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`;
+        const generationConfig: Record<string, unknown> = {};
+        if (targetModel === 'gemini-4-hydrogen') {
+          generationConfig.thinkingConfig = { thinkingLevel: 'MEDIUM' };
+        }
+        return fetch(endpoint, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            contents,
+            ...(sys ? { systemInstruction: { parts: [{ text: sys }] } } : {}),
+            ...(Object.keys(generationConfig).length ? { generationConfig } : {}),
+          }),
+        });
+      };
+
+      let upstream = await callGeminiEdge(effectiveModel);
+      if ((!upstream.ok || !upstream.body) && effectiveModel === 'gemini-4-hydrogen' && (upstream.status === 503 || upstream.status === 429)) {
+        effectiveModel = 'gemini-3.1-flash-lite';
+        upstream = await callGeminiEdge(effectiveModel);
+      }
       if (!upstream.ok || !upstream.body) {
         return jsonRes({ error: (await upstream.text()) || 'Gemini 请求失败' }, upstream.status);
       }
@@ -718,6 +739,18 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
       const decoder = new TextDecoder();
       (async () => {
         let buf = '';
+        const emitLine = async (ln: string) => {
+          if (!ln.startsWith('data:')) return;
+          const raw = ln.slice(5).trim();
+          if (!raw) return;
+          try {
+            const parsed = JSON.parse(raw);
+            const text = parsed?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+            if (text) await writer.write(encoder.encode(`data: ${JSON.stringify({ response: text })}\n\n`));
+          } catch {
+            // ignore
+          }
+        };
         try {
           while (true) {
             const { value, done } = await reader.read();
@@ -726,17 +759,11 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
             const lines = buf.split('\n');
             buf = lines.pop() || '';
             for (const ln of lines) {
-              if (!ln.startsWith('data:')) continue;
-              const raw = ln.slice(5).trim();
-              if (!raw) continue;
-              try {
-                const parsed = JSON.parse(raw);
-                const text = parsed?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-                if (text) await writer.write(encoder.encode(`data: ${JSON.stringify({ response: text })}\n\n`));
-              } catch {
-                // ignore
-              }
+              await emitLine(ln);
             }
+          }
+          if (buf.trim()) {
+            await emitLine(buf.trim());
           }
           await writer.write(encoder.encode('data: [DONE]\n\n'));
         } finally {

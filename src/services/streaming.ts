@@ -188,7 +188,14 @@ export async function streamChatCompletion(params: {
         errText = await res.text();
         const parsed = JSON.parse(errText);
         if (parsed?.error) {
-          errText = typeof parsed.error === 'string' ? parsed.error : JSON.stringify(parsed.error);
+          let inner = typeof parsed.error === 'string' ? parsed.error : JSON.stringify(parsed.error);
+          try {
+            const nested = JSON.parse(inner);
+            if (nested?.error?.message) inner = nested.error.message;
+          } catch {
+            // keep inner
+          }
+          errText = inner;
         }
       } catch {
         // use raw text
@@ -204,44 +211,50 @@ export async function streamChatCompletion(params: {
     const decoder = new TextDecoder();
     let buffer = '';
 
+    const processLine = (line: string) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) return;
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === '[DONE]') return;
+      try {
+        const json = JSON.parse(payload);
+        if (json?.error) {
+          throw new Error(typeof json.error === 'string' ? json.error : json.error.message || '模型返回错误');
+        }
+        const deltaObj = json?.choices?.[0]?.delta;
+        let piece = '';
+        if (typeof json?.response === 'string') {
+          piece = json.response;
+        } else if (deltaObj) {
+          if (typeof deltaObj.reasoning_content === 'string' && deltaObj.reasoning_content) {
+            piece = deltaObj.reasoning_content;
+          }
+          if (typeof deltaObj.content === 'string' && deltaObj.content) {
+            piece += deltaObj.content;
+          }
+        }
+        if (piece) {
+          callbacks.onChunk(piece);
+        }
+      } catch (parseErr: any) {
+        if (parseErr?.message && !parseErr.message.includes('JSON')) {
+          throw parseErr;
+        }
+      }
+    };
+
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
-
       for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const payload = trimmed.slice(5).trim();
-        if (!payload || payload === '[DONE]') continue;
-        try {
-          const json = JSON.parse(payload);
-          if (json?.error) {
-            throw new Error(typeof json.error === 'string' ? json.error : json.error.message || '模型返回错误');
-          }
-          const deltaObj = json?.choices?.[0]?.delta;
-          let piece = '';
-          if (typeof json?.response === 'string') {
-            piece = json.response;
-          } else if (deltaObj) {
-            if (typeof deltaObj.reasoning_content === 'string' && deltaObj.reasoning_content) {
-              piece = deltaObj.reasoning_content;
-            }
-            if (typeof deltaObj.content === 'string' && deltaObj.content) {
-              piece += deltaObj.content;
-            }
-          }
-          if (piece) {
-            callbacks.onChunk(piece);
-          }
-        } catch (parseErr: any) {
-          if (parseErr?.message && !parseErr.message.includes('JSON')) {
-            throw parseErr;
-          }
-        }
+        processLine(line);
       }
+    }
+    if (buffer.trim()) {
+      processLine(buffer);
     }
 
     callbacks.onDone();

@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import JSZip from 'jszip';
 import {
   s3DeleteObject,
@@ -481,33 +481,82 @@ function buildOpenAIMessages(messages: IncomingChatMessage[]): Array<{ role: str
   });
 }
 
+function formatFriendlyGeminiError(err: any): string {
+  const raw = err?.message || String(err || 'Gemini 请求失败');
+  if (raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand')) {
+    return 'Gemini 上游服务当前高负载繁忙 (503)，已自动重试仍繁忙，请稍候片刻再试或切换至 Gemini 3.1 Flash Lite / 其他模型。';
+  }
+  if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
+    return '已触发 Gemini 免费层频率或配额限制 (429)，请稍候 1 分钟再试或切换其他已连通模型。';
+  }
+  if (raw.includes('404') || raw.includes('NOT_FOUND')) {
+    return '所选 Gemini 模型 ID 不可用或已下线 (404)，请切换至 Gemini 4 Hydrogen 或 Gemini 3.1 Flash Lite。';
+  }
+  if (raw.includes('403') || raw.includes('401') || raw.includes('API_KEY_INVALID')) {
+    return 'Gemini API Key 无效或权限不足，请检查后端环境变量 GEMINI_API_KEY 配置。';
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed?.error?.message) return String(parsed.error.message);
+  } catch {
+    // ignore
+  }
+  return raw.slice(0, 260);
+}
+
+async function withGeminiRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+  let lastErr: any;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastErr = err;
+      const msg = String(err?.message || '');
+      const retryable = msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
+      if (!retryable || attempt === maxRetries) break;
+      await new Promise((r) => setTimeout(r, 750 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 function buildGeminiContents(messages: IncomingChatMessage[]): Array<{ role: string; parts: Array<Record<string, unknown>> }> {
-  return messages
-    .filter((m) => m.role !== 'system')
-    .map((m) => {
-      const parts: Array<Record<string, unknown>> = [];
-      const text = formatMessageTextWithFiles(m);
-      if (text) {
-        parts.push({ text });
+  const mapped: Array<{ role: string; parts: Array<Record<string, unknown>> }> = [];
+  for (const m of messages) {
+    if (m.role === 'system') continue;
+    const role = m.role === 'assistant' ? 'model' : 'user';
+    const parts: Array<Record<string, unknown>> = [];
+    const text = formatMessageTextWithFiles(m);
+    if (text) {
+      parts.push({ text });
+    }
+    const images = (m.attachments || []).filter((a) => a.kind === 'image' && a.dataUrl);
+    for (const img of images) {
+      const match = (img.dataUrl || '').match(/^data:([^;]+);base64,(.+)$/);
+      if (match) {
+        parts.push({
+          inlineData: {
+            mimeType: match[1],
+            data: match[2],
+          },
+        });
       }
-      const images = (m.attachments || []).filter((a) => a.kind === 'image' && a.dataUrl);
-      for (const img of images) {
-        const match = (img.dataUrl || '').match(/^data:([^;]+);base64,(.+)$/);
-        if (match) {
-          parts.push({
-            inlineData: {
-              mimeType: match[1],
-              data: match[2],
-            },
-          });
-        }
-      }
-      if (parts.length === 0) parts.push({ text: '' });
-      return {
-        role: m.role === 'assistant' ? 'model' : 'user',
-        parts,
-      };
-    });
+    }
+    if (parts.length === 0) continue;
+    if (mapped.length === 0 && role === 'model') {
+      mapped.push({ role: 'user', parts: [{ text: '请继续。' }] });
+    }
+    const prev = mapped[mapped.length - 1];
+    if (prev && prev.role === role) {
+      prev.parts.push(...parts);
+    } else {
+      mapped.push({ role, parts });
+    }
+  }
+  if (mapped.length === 0) {
+    mapped.push({ role: 'user', parts: [{ text: '你好' }] });
+  }
+  return mapped;
 }
 
 async function createServer() {
@@ -691,12 +740,49 @@ async function createServer() {
           res.json({ status: 'unconfigured', message: '未配置 GEMINI_API_KEY 环境变量' });
           return;
         }
-        const probeModel = modelId || 'gemini-3.1-flash-lite';
-        await ai.models.generateContent({
-          model: probeModel,
-          contents: 'Reply with OK',
-        });
-        res.json({ status: 'connected', latencyMs: Date.now() - start, message: `已连通 (${probeModel})` });
+        const rawProbe = modelId === 'gemini-2.5-flash' ? 'gemini-3.1-flash-lite' : (modelId || 'gemini-3.1-flash-lite');
+        const probeModel = rawProbe;
+        try {
+          const probeRun = () =>
+            withGeminiRetry(
+              () =>
+                ai.models.generateContent({
+                  model: probeModel,
+                  contents: 'Reply with OK',
+                  ...(probeModel.startsWith('gemini-4')
+                    ? { config: { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } }
+                    : {}),
+                }),
+              1
+            );
+          if (probeModel !== 'gemini-3.1-flash-lite') {
+            await Promise.race([
+              probeRun(),
+              new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error('503 UNAVAILABLE: probe timeout')), 10000)
+              ),
+            ]);
+          } else {
+            await probeRun();
+          }
+          res.json({ status: 'connected', latencyMs: Date.now() - start, message: `已连通 (${probeModel})` });
+        } catch (probeErr: any) {
+          const msg = String(probeErr?.message || '');
+          // If primary model has a transient 503 spike or slow response, verify with gemini-3.1-flash-lite
+          if (probeModel !== 'gemini-3.1-flash-lite' && (msg.includes('503') || msg.includes('timeout') || msg.includes('UNAVAILABLE'))) {
+            await ai.models.generateContent({
+              model: 'gemini-3.1-flash-lite',
+              contents: 'Reply with OK',
+            });
+            res.json({
+              status: 'connected',
+              latencyMs: Date.now() - start,
+              message: `Gemini API 已连通 (${probeModel} 当前高负载，已自动切至 gemini-3.1-flash-lite)`,
+            });
+          } else {
+            throw probeErr;
+          }
+        }
         return;
       }
 
@@ -768,7 +854,7 @@ async function createServer() {
       res.json({
         status: 'error',
         latencyMs: Date.now() - start,
-        message: err?.message || '网络探测失败',
+        message: providerType === 'gemini' ? formatFriendlyGeminiError(err) : err?.message || '网络探测失败',
       });
     }
   });
@@ -801,8 +887,8 @@ async function createServer() {
     }
 
     const ac = new AbortController();
-    req.on('close', () => {
-      if (!res.writableEnded) ac.abort();
+    res.on('close', () => {
+      if (!res.writableFinished) ac.abort();
     });
 
     try {
@@ -817,31 +903,83 @@ async function createServer() {
           return;
         }
 
+        let effectiveModel = model === 'gemini-2.5-flash' ? 'gemini-4-hydrogen' : model;
         const systemMsg = messages.find((m) => m.role === 'system')?.content;
         const convo = buildGeminiContents(messages);
+
+        const buildGeminiConfig = (targetModel: string) => {
+          const isG4 = targetModel.startsWith('gemini-4');
+          const cfg: Record<string, unknown> = {};
+          if (systemMsg) cfg.systemInstruction = systemMsg;
+          if (targetModel === 'gemini-4-hydrogen') {
+            cfg.thinkingConfig = { thinkingLevel: ThinkingLevel.MEDIUM };
+          } else if (!isG4 && typeof temperature === 'number') {
+            cfg.temperature = temperature;
+          }
+          return cfg;
+        };
+
+        let stream: AsyncIterable<any>;
+        const openGeminiStream = async (targetModel: string, timeoutMs?: number) => {
+          const cfg = buildGeminiConfig(targetModel);
+          const run = () =>
+            ai.models.generateContentStream({
+              model: targetModel,
+              contents: convo as any,
+              config: Object.keys(cfg).length ? cfg : undefined,
+            });
+          if (!timeoutMs) {
+            return withGeminiRetry(run, 1);
+          }
+          return Promise.race([
+            withGeminiRetry(run, 0),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('503 UNAVAILABLE: Gemini 4 Hydrogen response timeout')), timeoutMs)
+            ),
+          ]);
+        };
+
+        try {
+          stream = await openGeminiStream(
+            effectiveModel,
+            effectiveModel === 'gemini-4-hydrogen' ? 12000 : undefined
+          );
+        } catch (geminiErr: any) {
+          const msg = String(geminiErr?.message || '');
+          const isOverloaded =
+            msg.includes('503') ||
+            msg.includes('UNAVAILABLE') ||
+            msg.includes('high demand') ||
+            msg.includes('timeout');
+          if (effectiveModel === 'gemini-4-hydrogen' && isOverloaded) {
+            try {
+              effectiveModel = 'gemini-3.1-flash-lite';
+              stream = await openGeminiStream(effectiveModel);
+            } catch (fallbackErr: any) {
+              res.status(503).json({ error: formatFriendlyGeminiError(fallbackErr) });
+              return;
+            }
+          } else {
+            res.status(503).json({ error: formatFriendlyGeminiError(geminiErr) });
+            return;
+          }
+        }
 
         res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
 
-        const isGemini4 = model.startsWith('gemini-4');
-        const config: Record<string, unknown> = {};
-        if (systemMsg) config.systemInstruction = systemMsg;
-        if (!isGemini4 && typeof temperature === 'number') {
-          config.temperature = temperature;
-        }
-
-        const stream = await ai.models.generateContentStream({
-          model,
-          contents: convo as any,
-          config: Object.keys(config).length ? config : undefined,
-        });
-
-        for await (const chunk of stream) {
-          if (ac.signal.aborted) break;
-          const text = chunk.text || '';
-          if (text) {
-            res.write(`data: ${JSON.stringify({ response: text })}\n\n`);
+        try {
+          for await (const chunk of stream) {
+            if (ac.signal.aborted) break;
+            const text = chunk.text || '';
+            if (text) {
+              res.write(`data: ${JSON.stringify({ response: text })}\n\n`);
+            }
+          }
+        } catch (streamErr: any) {
+          if (!ac.signal.aborted) {
+            res.write(`data: ${JSON.stringify({ response: `\n\n[流式中断提示: ${formatFriendlyGeminiError(streamErr)}]` })}\n\n`);
           }
         }
         res.write('data: [DONE]\n\n');

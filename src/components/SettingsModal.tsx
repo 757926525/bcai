@@ -225,21 +225,57 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6">
           {tab === 'appearance' ? (
             <div className="space-y-5">
-              {/* Theme Grid */}
-              <div className="space-y-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <h3 className="text-sm font-semibold wb-ink">工作台配色主题（含 CF 原生同款）</h3>
-                    <p className="text-xs wb-muted">所有主题均支持浅色 / 深色双模式即时切换</p>
+              {/* Quick Display & Layout Switchers (Moved here from mobile header) */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="rounded-xl border wb-border wb-bg p-4 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold wb-ink">夜间 / 浅色模式</div>
+                    <p className="text-xs wb-muted mt-0.5">切换工作台浅色护眼或深色夜间模式</p>
                   </div>
                   <button
                     type="button"
                     onClick={onToggleDark}
-                    className="h-9 px-3.5 rounded-lg border wb-border wb-bg text-xs font-medium wb-ink inline-flex items-center gap-1.5"
+                    className="h-9 px-3.5 rounded-lg border wb-border wb-panel text-xs font-medium wb-ink inline-flex items-center gap-1.5 shrink-0 hover:opacity-85"
                   >
-                    {dark ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
-                    <span>{dark ? '当前深色 · 切浅色' : '当前浅色 · 切深色'}</span>
+                    {dark ? <Sun className="w-3.5 h-3.5 text-amber-500" /> : <Moon className="w-3.5 h-3.5" />}
+                    <span>{dark ? '夜间 · 切浅色' : '浅色 · 切夜间'}</span>
                   </button>
+                </div>
+
+                <div className="rounded-xl border wb-border wb-bg p-4 flex flex-wrap items-center justify-between gap-2.5">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold wb-ink">手机 / 电脑界面切换</div>
+                    <p className="text-xs wb-muted mt-0.5">支持自适应、手机触控或电脑宽屏</p>
+                  </div>
+                  <div className="flex items-center gap-1 p-1 rounded-lg wb-panel border wb-border shrink-0">
+                    {(
+                      [
+                        ['auto', '自适应', Laptop],
+                        ['mobile', '手机', Smartphone],
+                        ['desktop', '电脑', Laptop],
+                      ] as Array<[LayoutMode, string, React.ComponentType<{ className?: string }>]>
+                    ).map(([k, label, Icon]) => (
+                      <button
+                        key={k}
+                        type="button"
+                        onClick={() => onChangeLayoutMode(k)}
+                        className={`h-8 px-2.5 rounded-md text-xs font-medium inline-flex items-center gap-1 ${
+                          layoutMode === k ? 'wb-accent' : 'wb-muted'
+                        }`}
+                      >
+                        <Icon className="w-3.5 h-3.5" />
+                        <span>{label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* Theme Grid */}
+              <div className="space-y-3">
+                <div>
+                  <h3 className="text-sm font-semibold wb-ink">工作台配色主题（6 款 · 含 CF 原生同款）</h3>
+                  <p className="text-xs wb-muted">所有主题均支持浅色 / 深色双模式即时切换</p>
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
@@ -270,35 +306,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       </button>
                     );
                   })}
-                </div>
-              </div>
-
-              {/* Layout Switcher */}
-              <div className="rounded-xl border wb-border wb-bg p-4 flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <div className="text-sm font-semibold wb-ink">界面布局模式（手机 / 电脑一键切换）</div>
-                  <p className="text-xs wb-muted">手机布局强化单手触控、全屏窄框零文字遮挡；电脑布局默认展开侧边栏与双栏预览。</p>
-                </div>
-                <div className="flex items-center gap-1 p-1 rounded-lg wb-panel border wb-border">
-                  {(
-                    [
-                      ['auto', '自适应', Laptop],
-                      ['mobile', '手机布局', Smartphone],
-                      ['desktop', '电脑布局', Laptop],
-                    ] as Array<[LayoutMode, string, React.ComponentType<{ className?: string }>]>
-                  ).map(([k, label, Icon]) => (
-                    <button
-                      key={k}
-                      type="button"
-                      onClick={() => onChangeLayoutMode(k)}
-                      className={`h-8 px-3 rounded-md text-xs font-medium inline-flex items-center gap-1.5 ${
-                        layoutMode === k ? 'wb-accent' : 'wb-muted'
-                      }`}
-                    >
-                      <Icon className="w-3.5 h-3.5" />
-                      <span>{label}</span>
-                    </button>
-                  ))}
                 </div>
               </div>
             </div>

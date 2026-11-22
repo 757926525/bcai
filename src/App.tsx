@@ -83,10 +83,61 @@ function parseRepoSlug(urlOrSlug: string): string {
   }
 }
 
+function pickBestDefaultModel(
+  targetMode: 'chat' | 'code' | 'repo',
+  cfg: PublicConfig | null,
+  providerList: ExternalProvider[]
+): { modelId: string; providerId: string } {
+  const customWorkers = providerList.find((p) => p.id === 'builtin-workers-ai');
+  if (cfg?.envProviders.workersAi || (customWorkers?.accountId && customWorkers?.apiKey)) {
+    return {
+      modelId:
+        targetMode === 'code' || targetMode === 'repo'
+          ? '@cf/qwen/qwen2.5-coder-32b-instruct'
+          : '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+      providerId: 'builtin-workers-ai',
+    };
+  }
+  const customGemini = providerList.find((p) => p.id === 'builtin-gemini');
+  if (cfg?.envProviders.gemini || customGemini?.apiKey) {
+    return { modelId: 'gemini-3.1-flash-lite', providerId: 'builtin-gemini' };
+  }
+  const customDeepSeek = providerList.find((p) => p.id === 'builtin-deepseek');
+  if (cfg?.envProviders.deepseek || customDeepSeek?.apiKey) {
+    return { modelId: 'deepseek-chat', providerId: 'builtin-deepseek' };
+  }
+  const customGroq = providerList.find((p) => p.id === 'builtin-groq');
+  if (cfg?.envProviders.groq || customGroq?.apiKey) {
+    return { modelId: 'llama-3.3-70b-versatile', providerId: 'builtin-groq' };
+  }
+  const customOr = providerList.find((p) => p.id === 'builtin-openrouter');
+  if (cfg?.envProviders.openrouter || customOr?.apiKey) {
+    return {
+      modelId: targetMode === 'code' || targetMode === 'repo' ? 'qwen/qwen3-235b-a22b:free' : 'meta-llama/llama-3.3-70b-instruct:free',
+      providerId: 'builtin-openrouter',
+    };
+  }
+  if (cfg?.envProviders.openai && cfg.envProviders.openaiModels.length > 0) {
+    return { modelId: cfg.envProviders.openaiModels[0], providerId: 'builtin-env-openai' };
+  }
+  const anyCustom = providerList.find((p) => p.enabled && p.apiKey?.trim() && p.models.length > 0);
+  if (anyCustom) {
+    return { modelId: anyCustom.models[0], providerId: anyCustom.id };
+  }
+  return {
+    modelId:
+      targetMode === 'code' || targetMode === 'repo'
+        ? '@cf/qwen/qwen2.5-coder-32b-instruct'
+        : '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    providerId: 'builtin-workers-ai',
+  };
+}
+
 function createInitialConversation(
   mode: 'chat' | 'code' | 'repo' = 'code',
   repoFullName?: string,
-  repoBranch?: string
+  repoBranch?: string,
+  preferred?: { modelId: string; providerId: string }
 ): Conversation {
   const now = new Date().toISOString();
   return {
@@ -94,10 +145,11 @@ function createInitialConversation(
     title: mode === 'repo' ? `仓库对话: ${repoFullName || '757926525/bcai'}` : mode === 'code' ? '新编程会话' : '新对话',
     mode,
     modelId:
-      mode === 'code'
+      preferred?.modelId ||
+      (mode === 'code' || mode === 'repo'
         ? '@cf/qwen/qwen2.5-coder-32b-instruct'
-        : '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-    providerId: 'builtin-workers-ai',
+        : '@cf/meta/llama-3.3-70b-instruct-fp8-fast'),
+    providerId: preferred?.providerId || 'builtin-workers-ai',
     repoFullName: mode === 'repo' ? repoFullName || '757926525/bcai' : undefined,
     repoBranch: mode === 'repo' ? repoBranch || 'main' : undefined,
     status: 'active',
@@ -188,7 +240,10 @@ export default function App() {
 
   const [conversations, setConversations] = useState<Conversation[]>(() => {
     const saved = loadLocalJson<Conversation[]>(LS_CONVS, []);
-    return saved.length > 0 ? saved : [createInitialConversation('code')];
+    if (saved.length === 0) return [createInitialConversation('code')];
+    return saved.map((c) =>
+      c.modelId === 'gemini-2.5-flash' ? { ...c, modelId: 'gemini-3.1-flash-lite' } : c
+    );
   });
   const [activeId, setActiveId] = useState<string>(() => loadLocalJson<string>(LS_ACTIVE, ''));
 
@@ -234,7 +289,16 @@ export default function App() {
   // Providers & Real Statuses
   const [providers, setProviders] = useState<ExternalProvider[]>(() => {
     const saved = loadLocalJson<ExternalProvider[]>(LS_PROVIDERS, []);
-    return saved.length > 0 ? saved : DEFAULT_PROVIDERS;
+    if (saved.length === 0) return DEFAULT_PROVIDERS;
+    return saved.map((p) => {
+      if (p.id === 'builtin-gemini') {
+        const cleaned = p.models.filter((m) => m !== 'gemini-2.5-flash');
+        if (!cleaned.includes('gemini-4-hydrogen')) cleaned.unshift('gemini-4-hydrogen');
+        if (!cleaned.includes('gemini-3.1-flash-lite')) cleaned.push('gemini-3.1-flash-lite');
+        return { ...p, models: cleaned };
+      }
+      return p;
+    });
   });
 
   useEffect(() => {
@@ -370,11 +434,26 @@ export default function App() {
             ];
           });
         }
+
+        // Auto-select an active configured model for empty initial conversations if Workers AI is unconfigured
+        if (!cfg.envProviders.workersAi) {
+          setConversations((prev) =>
+            prev.map((c) => {
+              if (c.messages.length === 0 && c.providerId === 'builtin-workers-ai') {
+                const best = pickBestDefaultModel(c.mode, cfg, providers);
+                if (best.providerId !== 'builtin-workers-ai') {
+                  return { ...c, modelId: best.modelId, providerId: best.providerId };
+                }
+              }
+              return c;
+            })
+          );
+        }
       }
     } catch {
       // ignore
     }
-  }, []);
+  }, [providers]);
 
   useEffect(() => {
     loadConfigAndAuth();
@@ -540,7 +619,12 @@ export default function App() {
         if (match) {
           setActiveId(match.id);
         } else {
-          const created = createInitialConversation(nextMode, gitState.repo, gitState.branch);
+          const created = createInitialConversation(
+            nextMode,
+            gitState.repo,
+            gitState.branch,
+            pickBestDefaultModel(nextMode, publicConfig, providers)
+          );
           setConversations((prev) => [created, ...prev]);
           setActiveId(created.id);
         }
@@ -551,7 +635,12 @@ export default function App() {
   const handleNewConversation = (targetMode: 'chat' | 'code' = mode === 'code' ? 'code' : 'chat') => {
     if (isStreaming) return;
     if (mode !== 'code' && mode !== 'chat') setMode(targetMode);
-    const created = createInitialConversation(targetMode, gitState.repo, gitState.branch);
+    const created = createInitialConversation(
+      targetMode,
+      gitState.repo,
+      gitState.branch,
+      pickBestDefaultModel(targetMode, publicConfig, providers)
+    );
     setConversations((prev) => [created, ...prev]);
     setActiveId(created.id);
     setSidebarOpen(false);
@@ -562,7 +651,12 @@ export default function App() {
     setConversations((prev) => {
       const filtered = prev.filter((c) => c.id !== id);
       if (filtered.length === 0) {
-        const fresh = createInitialConversation('code');
+        const fresh = createInitialConversation(
+          'code',
+          undefined,
+          undefined,
+          pickBestDefaultModel('code', publicConfig, providers)
+        );
         setActiveId(fresh.id);
         return [fresh];
       }
@@ -686,7 +780,11 @@ export default function App() {
   };
 
   const handleSendMessage = async (text: string, attachments?: ChatAttachment[]) => {
-    if (!activeConv || isStreaming || activeConv.status === 'paused') return;
+    if (!activeConv || isStreaming) return;
+    if (activeConv.status === 'paused') {
+      showToast('当前会话已暂停，请先点击右上角“恢复会话”按钮后再发送');
+      return;
+    }
     const now = new Date().toISOString();
     const userMsg = {
       id: uid(),
@@ -1041,12 +1139,13 @@ export default function App() {
       return;
     }
     const now = new Date().toISOString();
+    const bestRepo = pickBestDefaultModel('repo', publicConfig, providers);
     const conv: Conversation = {
       id: uid(),
       title: filePath ? `${repo.split('/')[1] || repo}: ${filePath.split('/').pop()}` : `仓库: ${repo}`,
       mode: 'repo',
-      modelId: activeConv?.modelId || '@cf/qwen/qwen2.5-coder-32b-instruct',
-      providerId: activeConv?.providerId || 'builtin-workers-ai',
+      modelId: activeConv?.modelId || bestRepo.modelId,
+      providerId: activeConv?.providerId || bestRepo.providerId,
       repoFullName: repo,
       repoBranch: branch,
       attachedFilePath: filePath,
@@ -1555,8 +1654,8 @@ export default function App() {
 
         {/* Main Content */}
         <main className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
-          {/* Top Header: Zero Mobile Edge Clipping */}
-          <header className="h-14 px-2.5 sm:px-4 border-b wb-border wb-panel flex items-center justify-between gap-2 shrink-0 min-w-0">
+          {/* Top Header: Mobile-friendly spacing so Sidebar & Image buttons are always visible */}
+          <header className="h-14 px-2 sm:px-4 border-b wb-border wb-panel flex items-center justify-between gap-1.5 sm:gap-2 shrink-0 min-w-0">
             <div className="flex items-center gap-1.5 sm:gap-2 min-w-0 flex-1">
               {isMobileLayout && (
                 <button
@@ -1569,13 +1668,13 @@ export default function App() {
                 </button>
               )}
 
-              <div className="flex items-center gap-1 p-1 rounded-lg wb-bg border wb-border overflow-x-auto no-scrollbar max-w-full">
+              <div className="flex items-center gap-0.5 sm:gap-1 p-1 rounded-lg wb-bg border wb-border overflow-x-auto no-scrollbar max-w-full">
                 {modeTabs.map(([mKey, label, Icon]) => (
                   <button
                     key={mKey}
                     type="button"
                     onClick={() => handleSwitchMode(mKey)}
-                    className={`h-8 px-2.5 sm:px-3 rounded-md text-xs font-medium inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+                    className={`h-8 px-2 sm:px-3 rounded-md text-xs font-medium inline-flex items-center gap-1 sm:gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
                       mode === mKey ? 'wb-panel wb-ink shadow-sm' : 'wb-muted hover:wb-ink'
                     }`}
                   >
@@ -1586,7 +1685,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex items-center gap-1.5 shrink-0">
+            <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
               {mode !== 'image' && mode !== 'connectors' && activeConv && (
                 <ModelSelectorPopover
                   models={allModels}
@@ -1605,7 +1704,7 @@ export default function App() {
                 />
               )}
 
-              {/* Pause / Resume Session Button (Top-Right Corner Only, Saves Vertical Space on Mobile) */}
+              {/* Pause / Resume Session Button (Top-Right Corner Only) */}
               {activeConv && (mode === 'code' || mode === 'chat' || (mode === 'repo' && repoSubView === 'chat')) && (
                 <button
                   type="button"
@@ -1632,48 +1731,50 @@ export default function App() {
                 </button>
               )}
 
-              {/* 1-Click Mobile / Desktop Layout Switch */}
-              <button
-                type="button"
-                onClick={cycleLayoutMode}
-                className="h-9 sm:h-10 px-2 sm:px-2.5 rounded-lg border wb-border flex items-center justify-center gap-1 wb-ink hover:opacity-80 shrink-0"
-                title={isMobileLayout ? '切换为电脑布局' : '切换为手机布局'}
-                aria-label="切换手机或电脑布局"
-              >
-                {isMobileLayout ? <Laptop className="w-4 h-4" /> : <Smartphone className="w-4 h-4" />}
-                {!isMobileLayout && <span className="hidden xl:inline text-xs">手机布局</span>}
-              </button>
+              {/* Desktop-only header controls (Moved into Settings -> 主题外观与布局 on Mobile) */}
+              {!isMobileLayout && (
+                <>
+                  <button
+                    type="button"
+                    onClick={cycleLayoutMode}
+                    className="h-9 sm:h-10 px-2 sm:px-2.5 rounded-lg border wb-border flex items-center justify-center gap-1 wb-ink hover:opacity-80 shrink-0"
+                    title="切换手机或电脑布局"
+                    aria-label="切换手机或电脑布局"
+                  >
+                    <Smartphone className="w-4 h-4" />
+                    <span className="hidden xl:inline text-xs">手机布局</span>
+                  </button>
 
-              {/* Theme Picker Quick Open */}
-              <button
-                type="button"
-                onClick={() => {
-                  setSettingsTab('appearance');
-                  setSettingsModalOpen(true);
-                }}
-                className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg border wb-border hidden sm:flex items-center justify-center wb-ink hover:opacity-80 shrink-0"
-                title="选择主题配色（6款）"
-                aria-label="选择主题配色"
-              >
-                <Palette className="w-4 h-4" />
-              </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSettingsTab('appearance');
+                      setSettingsModalOpen(true);
+                    }}
+                    className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg border wb-border hidden sm:flex items-center justify-center wb-ink hover:opacity-80 shrink-0"
+                    title="选择主题配色（6款）"
+                    aria-label="选择主题配色"
+                  >
+                    <Palette className="w-4 h-4" />
+                  </button>
 
-              {/* Light / Dark Toggle */}
-              <button
-                type="button"
-                onClick={() => setDark((d) => !d)}
-                className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg border wb-border flex items-center justify-center wb-ink hover:opacity-80 shrink-0"
-                aria-label="切换明暗主题"
-                title="切换明暗主题"
-              >
-                {dark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
-              </button>
+                  <button
+                    type="button"
+                    onClick={() => setDark((d) => !d)}
+                    className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg border wb-border flex items-center justify-center wb-ink hover:opacity-80 shrink-0"
+                    aria-label="切换明暗主题"
+                    title="切换明暗主题"
+                  >
+                    {dark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+                  </button>
+                </>
+              )}
 
               {/* Admin Login / Profile Button */}
               <button
                 type="button"
                 onClick={() => setAuthModalOpen(true)}
-                className={`h-9 sm:h-10 px-2.5 sm:px-3 rounded-lg border text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
+                className={`h-9 sm:h-10 px-2 sm:px-3 rounded-lg border text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
                   isAdmin ? 'border-emerald-500/50 wb-tint wb-accent-text' : 'wb-border wb-ink hover:opacity-80'
                 }`}
                 title="管理员登录与密码设置"
@@ -1874,7 +1975,12 @@ export default function App() {
         onProbeProvider={handleProbeProvider}
         onProbeAll={handleProbeAll}
         onClearAllConversations={() => {
-          const fresh = createInitialConversation('code');
+          const fresh = createInitialConversation(
+            'code',
+            undefined,
+            undefined,
+            pickBestDefaultModel('code', publicConfig, providers)
+          );
           setConversations([fresh]);
           setActiveId(fresh.id);
           setSettingsModalOpen(false);

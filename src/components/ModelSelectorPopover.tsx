@@ -65,7 +65,7 @@ export const ModelSelectorPopover: React.FC<ModelSelectorPopoverProps> = ({
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-2 h-9 sm:h-10 px-2.5 sm:px-3 rounded-lg border wb-border wb-panel hover:opacity-90 transition-colors max-w-[175px] sm:max-w-[290px]"
+        className="flex items-center gap-1.5 sm:gap-2 h-9 sm:h-10 px-2 sm:px-3 rounded-lg border wb-border wb-panel hover:opacity-90 transition-colors max-w-[118px] sm:max-w-[260px]"
         aria-expanded={open}
       >
         <StatusIndicator status={activeStatus.status} compact title={activeStatus.message} />

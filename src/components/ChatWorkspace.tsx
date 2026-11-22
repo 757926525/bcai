@@ -200,6 +200,13 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
       .flatMap((m) => extractCodeBlocks(m.content || ''));
 
     if (latestBlocks.length === 0) {
+      if (/^\/(?:save|存入连接器)\b/i.test(rawText.trim())) {
+        onAppendLocalExchange?.(
+          rawText,
+          '当前对话中还没有可保存的代码块，请先让 AI 生成代码后再发送 `/save` 或点击代码块右上角的「存入连接器」。'
+        );
+        return true;
+      }
       return false;
     }
 
@@ -824,7 +831,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
             ref={fileInputRef}
             type="file"
             multiple
-            accept="image/*,.txt,.md,.ts,.tsx,.js,.jsx,.py,.json,.csv,.html,.css,.sql,.toml,.yml,.yaml,.sh"
+            accept="image/*,.txt,.md,.ts,.tsx,.js,.jsx,.mjs,.cjs,.py,.go,.rs,.java,.c,.cpp,.h,.php,.rb,.vue,.svelte,.json,.jsonc,.csv,.html,.css,.scss,.sql,.toml,.yml,.yaml,.xml,.svg,.sh,.env,.log"
             onChange={(e) => {
               handleSelectFiles(e.target.files);
               e.target.value = '';

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Check, Copy, Database, GitBranch, Plug } from 'lucide-react';
+import { Check, Copy, Database, Download, GitBranch, Plug } from 'lucide-react';
 
 interface MarkdownRendererProps {
   content: string;
@@ -116,11 +116,28 @@ const CodeBlock: React.FC<{
     });
   };
 
+  const handleDownloadSnippet = () => {
+    const extMap: Record<string, string> = {
+      typescript: 'ts', ts: 'ts', tsx: 'tsx', javascript: 'js', js: 'js', jsx: 'jsx',
+      python: 'py', py: 'py', json: 'json', html: 'html', css: 'css', sql: 'sql',
+      bash: 'sh', sh: 'sh', markdown: 'md', md: 'md', yaml: 'yml', yml: 'yml',
+      toml: 'toml', rust: 'rs', go: 'go', java: 'java', cpp: 'cpp', c: 'c',
+    };
+    const ext = extMap[(lang || '').toLowerCase()] || 'txt';
+    const blob = new Blob([code], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `bcai-code.${ext}`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
   return (
     <div className="my-3 border border-slate-200 dark:border-slate-800 rounded-lg overflow-hidden bg-slate-50 dark:bg-slate-900/90">
-      <div className="flex items-center justify-between gap-2 px-3 py-1.5 border-b border-slate-200 dark:border-slate-800 bg-slate-100/80 dark:bg-slate-900 text-xs text-slate-600 dark:text-slate-400">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 border-b border-slate-200 dark:border-slate-800 bg-slate-100/80 dark:bg-slate-900 text-xs text-slate-600 dark:text-slate-400">
         <span className="font-mono">{lang || 'text'}</span>
-        <div className="flex items-center gap-1">
+        <div className="flex flex-wrap items-center justify-end gap-1">
           {onSaveCodeToDb && (
             <button
               type="button"
@@ -154,6 +171,15 @@ const CodeBlock: React.FC<{
               <span>存入连接器</span>
             </button>
           )}
+          <button
+            type="button"
+            onClick={handleDownloadSnippet}
+            className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-slate-200/70 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition-colors whitespace-nowrap shrink-0"
+            title="下载当前代码块文件"
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span>下载</span>
+          </button>
           <button
             type="button"
             onClick={handleCopy}
