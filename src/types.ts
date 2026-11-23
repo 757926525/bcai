@@ -146,6 +146,9 @@ export interface GeneratedImageCard {
   createdAt: string;
   savedToDb?: boolean;
   savedToBucket?: boolean;
+  dbAssetId?: string;
+  bucketKey?: string;
+  syncedAt?: string;
   error?: string;
   loading?: boolean;
 }

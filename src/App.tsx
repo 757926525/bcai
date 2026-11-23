@@ -32,7 +32,8 @@ import { ConversationExportModal } from './components/ConversationExportModal';
 import { DatabaseDrawer } from './components/DatabaseDrawer';
 import { DeployModal } from './components/DeployModal';
 import { GitHubWorkspace } from './components/GitHubWorkspace';
-import { ImageWorkspace } from './components/ImageWorkspace';
+import { ImageWorkspace, SaveImageResult } from './components/ImageWorkspace';
+import { ModelLimitModal } from './components/ModelLimitModal';
 import { ModelSelectorPopover } from './components/ModelSelectorPopover';
 import { SettingsModal } from './components/SettingsModal';
 import { ProjectWritePhase } from './components/StatusIndicator';
@@ -42,7 +43,7 @@ import {
   ORIGINAL_WORKBENCH_MODELS,
   SYSTEM_PROMPTS,
 } from './data/models';
-import { probeProviderConnection, streamChatCompletion } from './services/streaming';
+import { probeProviderConnection, streamChatCompletion, StreamHttpError } from './services/streaming';
 import {
   BucketStatusInfo,
   ChatAttachment,
@@ -57,18 +58,21 @@ import {
   ModelOption,
   ProviderStatusInfo,
   PublicConfig,
+  SavedAsset,
   SyncStatusInfo,
   ThemeId,
   WorkspaceMode,
 } from './types';
 import {
   analyzeProjectCompleteness,
+  buildCleanContinuationTail,
   hasUnclosedCodeFence,
   hasUnclosedThinkBlock,
   LANG_EXT_MAP,
   trimContinuationPrefix,
 } from './utils/codeBlocks';
 import { formatTimeShort, loadLocalJson, saveLocalJson, uid } from './utils/format';
+import { classifyLimitError, ModelLimitAlert, pickFallbackChatModel } from './utils/limitAlerts';
 
 const LS_CONVS = 'bcai.convs.v3';
 const LS_ACTIVE = 'bcai.active.v3';
@@ -80,6 +84,15 @@ const LS_THEME_ID = 'bcai.themeId.v3';
 const LS_LAYOUT_MODE = 'bcai.layoutMode.v3';
 const LS_TARGET_REPO = 'bcai.targetRepo.v3';
 const LS_AUTO_CONTINUE = 'bcai.autoContinue.v1';
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(String(reader.result || ''));
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
 
 function parseRepoSlug(urlOrSlug: string): string {
   const clean = (urlOrSlug || '').trim().replace(/\/+$/, '');
@@ -262,6 +275,8 @@ export default function App() {
       c.modelId === 'gemini-2.5-flash' ? { ...c, modelId: 'gemini-3.1-flash-lite' } : c
     );
   });
+  const conversationsRef = useRef<Conversation[]>(conversations);
+  conversationsRef.current = conversations;
   const [activeId, setActiveId] = useState<string>(() => loadLocalJson<string>(LS_ACTIVE, ''));
 
   const activeConv = useMemo(() => {
@@ -392,6 +407,12 @@ export default function App() {
   const [autoContinue, setAutoContinue] = useState<boolean>(() => loadLocalJson<boolean>(LS_AUTO_CONTINUE, true));
   const [autoContinueRound, setAutoContinueRound] = useState<number>(0);
   const [completenessDetail, setCompletenessDetail] = useState<string>('');
+  const [limitAlertState, setLimitAlertState] = useState<{
+    alert: ModelLimitAlert;
+    onRetry?: () => void;
+    onContinuePartial?: () => void;
+    onSwitchModel?: (modelId: string, providerId?: string) => void;
+  } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
@@ -649,6 +670,11 @@ export default function App() {
     return list;
   }, [providers]);
 
+  const allModelsRef = useRef<ModelOption[]>(allModels);
+  allModelsRef.current = allModels;
+  const providerStatusesRef = useRef<Record<string, ProviderStatusInfo>>(providerStatuses);
+  providerStatusesRef.current = providerStatuses;
+
   const activeModel = useMemo(
     () =>
       allModels.find((m) => m.id === activeConv?.modelId && m.providerId === activeConv?.providerId) ||
@@ -741,15 +767,19 @@ export default function App() {
     );
   };
 
-  const handleSelectModel = (modelId: string, providerId: string) => {
-    if (!activeConv) return;
+  const handleSelectModelForConv = (convId: string, modelId: string, providerId: string) => {
     setConversations((prev) =>
       prev.map((c) =>
-        c.id === activeConv.id
+        c.id === convId
           ? { ...c, modelId, providerId, updatedAt: new Date().toISOString() }
           : c
       )
     );
+  };
+
+  const handleSelectModel = (modelId: string, providerId: string) => {
+    if (!activeConv) return;
+    handleSelectModelForConv(activeConv.id, modelId, providerId);
   };
 
   const buildSystemPrompt = (conv: Conversation): string => {
@@ -793,6 +823,7 @@ export default function App() {
     let prefixBuffer = '';
     let roundAddedChars = 0;
     let willAutoContinue = false;
+    let latestLimitNotice = '';
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     let writingPhaseSignaled = false;
 
@@ -823,6 +854,61 @@ export default function App() {
       }
     };
 
+    const openChatLimitAlert = (params: {
+      rawMessage: string;
+      statusCode?: number;
+      finishReason?: string;
+      usedModelId: string;
+      writtenCount?: number;
+      missingFiles?: string[];
+      hasPartial: boolean;
+    }) => {
+      const modelsList = allModelsRef.current;
+      const statuses = providerStatusesRef.current;
+      const fallback = pickFallbackChatModel(params.usedModelId, modelsList, statuses, convMode);
+      const alert = classifyLimitError({
+        scope: 'chat',
+        rawMessage: params.rawMessage,
+        statusCode: params.statusCode,
+        finishReason: params.finishReason,
+        modelId: params.usedModelId,
+        providerType: provider?.providerType,
+        writtenCount: params.writtenCount,
+        missingFiles: params.missingFiles,
+      });
+      alert.canContinuePartial = params.hasPartial;
+      if (fallback) {
+        alert.recommendedModelId = fallback.id;
+        alert.recommendedProviderId = fallback.providerId;
+        alert.recommendedModelLabel = fallback.name;
+      }
+      setLimitAlertState({
+        alert,
+        onContinuePartial: params.hasPartial
+          ? () => void handleResumePartial(convId, assistantMsgId)
+          : undefined,
+        onRetry: !params.hasPartial ? () => void handleRetryLastUser(convId) : undefined,
+        onSwitchModel: (nextModelId, nextProviderId) => {
+          const targetPid =
+            nextProviderId ||
+            modelsList.find((m) => m.id === nextModelId)?.providerId ||
+            providerId;
+          handleSelectModelForConv(convId, nextModelId, targetPid);
+          if (params.hasPartial) {
+            void handleResumePartial(convId, assistantMsgId, {
+              modelId: nextModelId,
+              providerId: targetPid,
+            });
+          } else {
+            void handleRetryLastUser(convId, {
+              modelId: nextModelId,
+              providerId: targetPid,
+            });
+          }
+        },
+      });
+    };
+
     setIsStreaming(true);
     setAutoContinueRound(continuationDepth);
     if (continuationDepth === 0) {
@@ -845,11 +931,18 @@ export default function App() {
           if (meta.model) {
             setActiveStreamModel(meta.model);
           }
+          if (meta.limitNotice) {
+            latestLimitNotice = meta.limitNotice;
+          }
           if (meta.phase === 'fallback') {
             setWritePhase('fallback');
-            if (meta.model && meta.fromModel) {
+            if (meta.limitNotice) {
+              showToast(meta.limitNotice);
+            } else if (meta.model && meta.fromModel) {
               showToast(`${meta.fromModel} 响应超时，已自动切换至 ${meta.model}`);
             }
+          } else if (meta.phase === 'blocked') {
+            setWritePhase('truncated');
           } else if (meta.phase === 'connecting' || meta.phase === 'thinking') {
             setWritePhase(continuationDepth > 0 ? 'continuing' : meta.phase);
           } else if (meta.phase === 'writing') {
@@ -906,6 +999,7 @@ export default function App() {
             continuationDepth === 0 || roundAddedChars >= 12 || hasUnclosedCodeFence(accumulated);
 
           if (
+            report.reason !== 'blocked' &&
             report.incomplete &&
             autoContinue &&
             continuationDepth < MAX_AUTO_CONTINUE_ROUNDS &&
@@ -920,9 +1014,9 @@ export default function App() {
             setWritePhase('continuing');
             showToast(`检测到尚未完整输出（${report.detail}），正自动发起第 ${nextRound} 轮防中断续写…`);
 
-            const tailWindow = accumulated.slice(-14000);
-            const firstUserPrompt =
-              options?.historyBeforeAssistant?.find((m) => m.role === 'user')?.content?.slice(0, 2000) || '';
+            const { tailText, fenceStateNote } = buildCleanContinuationTail(accumulated, 14000);
+            const firstUserMsg = options?.historyBeforeAssistant?.find((m) => m.role === 'user');
+            const firstUserPrompt = firstUserMsg?.content?.slice(0, 2000) || '';
             const filesSummary =
               report.writtenFiles.length > 0
                 ? `已输出的代码文件/模块：${report.writtenFiles.join(', ')}`
@@ -935,16 +1029,23 @@ export default function App() {
             const nextMessages = [
               { role: 'system', content: options?.systemPrompt || SYSTEM_PROMPTS[convMode] },
               ...(firstUserPrompt
-                ? [{ role: 'user', content: `原始完整任务需求：\n${firstUserPrompt}` }]
+                ? [
+                    {
+                      role: 'user',
+                      content: `原始完整任务需求：\n${firstUserPrompt}`,
+                      ...(firstUserMsg?.attachments ? { attachments: firstUserMsg.attachments } : {}),
+                    },
+                  ]
                 : []),
               {
                 role: 'assistant',
-                content: `[前序已生成 ${accumulated.length} 字符。${filesSummary}]\n\n...${tailWindow}`,
+                content: `[前序已生成 ${accumulated.length} 字符。${filesSummary}]\n\n${tailText}`,
               },
               {
                 role: 'user',
                 content:
                   `断点续写指令（第 ${nextRound} 轮）：上面回复在结尾处尚未写完（原因：${report.detail}）。${missingHint}\n` +
+                  `${fenceStateNote}\n` +
                   `请紧接着上面最后一行代码或正文**无缝继续输出**剩余内容：\n` +
                   `1. 若处于代码块内部，请**直接输出后续代码**并在文件写完后用 \`\`\` 闭合，切勿重复 \`\`\`lang 开头或重写已完成的代码；\n` +
                   `2. 若还有未输出的项目文件，请逐个使用 \`\`\`lang path/to/file.ext 完整写出全部剩余文件（严禁省略占位）；\n` +
@@ -974,10 +1075,11 @@ export default function App() {
           setCompletenessDetail(report.detail);
           setAutoContinueRound(continuationDepth);
 
-          const stillIncomplete = Boolean(report.incomplete && accumulated.trim().length > 0);
-          setWritePhase(stillIncomplete ? 'truncated' : 'done');
+          const hasContent = accumulated.trim().length > 0;
+          const stillIncomplete = Boolean(report.incomplete && hasContent);
+          setWritePhase(stillIncomplete || !hasContent ? 'truncated' : 'done');
 
-          if (accumulated.trim().length > 0) {
+          if (hasContent) {
             if (!stillIncomplete) {
               showToast(`✅ ${report.detail}，已自动停止续写`);
             } else {
@@ -993,7 +1095,7 @@ export default function App() {
                 updatedAt: new Date().toISOString(),
                 messages: c.messages.map((m) => {
                   if (m.id !== assistantMsgId) return m;
-                  if (!accumulated) {
+                  if (!hasContent) {
                     return {
                       ...m,
                       interrupted: true,
@@ -1014,6 +1116,20 @@ export default function App() {
               };
             })
           );
+
+          if (!ac.signal.aborted && (stillIncomplete || report.reason === 'blocked' || !hasContent)) {
+            openChatLimitAlert({
+              rawMessage:
+                result.limitNotice ||
+                latestLimitNotice ||
+                (hasContent ? report.detail : '模型连接成功但未返回有效内容，可能触发了上游隐式配额或空响应限制。'),
+              finishReason: result.finishReason || (stillIncomplete && !result.finishReason ? 'MAX_TOKENS' : undefined),
+              usedModelId: result.activeModel || modelId,
+              writtenCount: report.writtenFiles.length,
+              missingFiles: report.missingFiles,
+              hasPartial: hasContent,
+            });
+          }
         },
         onError: (err) => {
           if (willAutoContinue) return;
@@ -1028,6 +1144,7 @@ export default function App() {
           const isAbort = err.name === 'AbortError';
           setWritePhase(isAbort ? 'paused' : 'error');
           setCompletenessDetail(isAbort ? '已手动暂停，可随时断点续写' : err.message);
+          const hasPartial = accumulated.trim().length > 0;
           setConversations((prev) =>
             prev.map((c) => {
               if (c.id !== convId) return c;
@@ -1054,6 +1171,15 @@ export default function App() {
               };
             })
           );
+
+          if (!isAbort) {
+            openChatLimitAlert({
+              rawMessage: err.message,
+              statusCode: (err as StreamHttpError)?.status,
+              usedModelId: modelId,
+              hasPartial,
+            });
+          }
         },
       },
     });
@@ -1121,27 +1247,34 @@ export default function App() {
     );
   };
 
-  const handleResumePartial = async () => {
-    if (!activeConv || isStreaming) return;
-    const last = activeConv.messages[activeConv.messages.length - 1];
+  const handleRetryLastUser = async (
+    overrideConvId?: string,
+    overrideModel?: { modelId: string; providerId: string }
+  ) => {
+    const targetConv = overrideConvId
+      ? conversationsRef.current.find((c) => c.id === overrideConvId)
+      : activeConv;
+    if (!targetConv || isStreaming) return;
+    const last = targetConv.messages[targetConv.messages.length - 1];
     if (!last || last.role !== 'assistant') return;
 
-    const cleanContent = last.content
-      .replace(/^（已暂停生成）$/, '')
-      .replace(/\n\n⚠️ [^\n]*$/, '')
-      .trimEnd();
-
     const assistantMsgId = last.id;
+    const targetModelId = overrideModel?.modelId || targetConv.modelId;
+    const targetProviderId = overrideModel?.providerId || targetConv.providerId;
+
     setConversations((prev) =>
       prev.map((c) =>
-        c.id === activeConv.id
+        c.id === targetConv.id
           ? {
               ...c,
+              modelId: targetModelId,
+              providerId: targetProviderId,
               messages: c.messages.map((m) =>
                 m.id === assistantMsgId
                   ? {
                       ...m,
-                      content: cleanContent,
+                      content: '',
+                      modelId: targetModelId,
                       paused: false,
                       truncated: false,
                       interrupted: false,
@@ -1154,43 +1287,124 @@ export default function App() {
       )
     );
 
-    const systemPrompt = buildSystemPrompt(activeConv);
-    const historyBeforeAssistant = activeConv.messages.slice(0, -1).map((m) => ({
+    const systemPrompt = buildSystemPrompt(targetConv);
+    const historyBeforeAssistant = targetConv.messages.slice(0, -1).map((m) => ({
       role: m.role,
       content: m.content,
       attachments: m.attachments,
     }));
-    const report = analyzeProjectCompleteness(cleanContent, activeConv.mode);
-    const tailWindow = cleanContent.slice(-14000);
-    const firstUserPrompt =
-      historyBeforeAssistant.find((m) => m.role === 'user')?.content?.slice(0, 2000) || '';
+    const payloadMessages = [{ role: 'system', content: systemPrompt }, ...historyBeforeAssistant];
+
+    await executeStream(
+      targetConv.id,
+      payloadMessages,
+      assistantMsgId,
+      targetModelId,
+      targetProviderId,
+      {
+        continuationDepth: 0,
+        existingContent: '',
+        systemPrompt,
+        convMode: targetConv.mode,
+        historyBeforeAssistant,
+      }
+    );
+  };
+
+  const handleResumePartial = async (
+    overrideConvId?: string,
+    overrideMsgId?: string,
+    overrideModel?: { modelId: string; providerId: string }
+  ) => {
+    const targetConv = overrideConvId
+      ? conversationsRef.current.find((c) => c.id === overrideConvId)
+      : activeConv;
+    if (!targetConv || isStreaming) return;
+    const last = overrideMsgId
+      ? targetConv.messages.find((m) => m.id === overrideMsgId)
+      : targetConv.messages[targetConv.messages.length - 1];
+    if (!last || last.role !== 'assistant') return;
+
+    const cleanContent = last.content
+      .replace(/^（已暂停生成）$/, '')
+      .replace(/\n\n⚠️ [^\n]*$/, '')
+      .trimEnd();
+
+    const assistantMsgId = last.id;
+    const targetModelId = overrideModel?.modelId || targetConv.modelId;
+    const targetProviderId = overrideModel?.providerId || targetConv.providerId;
+
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.id === targetConv.id
+          ? {
+              ...c,
+              modelId: targetModelId,
+              providerId: targetProviderId,
+              messages: c.messages.map((m) =>
+                m.id === assistantMsgId
+                  ? {
+                      ...m,
+                      content: cleanContent,
+                      modelId: targetModelId,
+                      paused: false,
+                      truncated: false,
+                      interrupted: false,
+                      completedCleanly: false,
+                    }
+                  : m
+              ),
+            }
+          : c
+      )
+    );
+
+    const systemPrompt = buildSystemPrompt(targetConv);
+    const historyBeforeAssistant = targetConv.messages.slice(0, -1).map((m) => ({
+      role: m.role,
+      content: m.content,
+      attachments: m.attachments,
+    }));
+    const report = analyzeProjectCompleteness(cleanContent, targetConv.mode);
+    const { tailText, fenceStateNote } = buildCleanContinuationTail(cleanContent, 14000);
+    const firstUserMsg = historyBeforeAssistant.find((m) => m.role === 'user');
+    const firstUserPrompt = firstUserMsg?.content?.slice(0, 2000) || '';
     const payloadMessages = [
       { role: 'system', content: systemPrompt },
-      ...(firstUserPrompt ? [{ role: 'user', content: `原始完整任务需求：\n${firstUserPrompt}` }] : []),
+      ...(firstUserPrompt
+        ? [
+            {
+              role: 'user',
+              content: `原始完整任务需求：\n${firstUserPrompt}`,
+              ...(firstUserMsg?.attachments ? { attachments: firstUserMsg.attachments } : {}),
+            },
+          ]
+        : []),
       {
         role: 'assistant',
-        content: `[前序已生成 ${cleanContent.length} 字符]\n\n...${tailWindow}`,
+        content: `[前序已生成 ${cleanContent.length} 字符]\n\n${tailText}`,
       },
       {
         role: 'user',
         content:
           `请紧接着上面最后一行无缝继续输出剩余内容（${report.detail}）。` +
           (report.missingFiles.length > 0 ? `仍待补全文件：${report.missingFiles.join(', ')}。` : '') +
+          `\n${fenceStateNote}\n` +
           `不要重复前面已完成的代码，若当前处于未闭合代码块内部直接接续代码并在结束时用 \`\`\` 闭合。`,
       },
     ];
 
     await executeStream(
-      activeConv.id,
+      targetConv.id,
       payloadMessages,
       assistantMsgId,
-      activeConv.modelId,
-      activeConv.providerId,
+      targetModelId,
+      targetProviderId,
       {
         continuationDepth: (last.autoContinuedRounds || 0) + 1,
         existingContent: cleanContent,
         systemPrompt,
-        convMode: activeConv.mode,
+        convMode: targetConv.mode,
         historyBeforeAssistant,
       }
     );
@@ -1232,10 +1446,14 @@ export default function App() {
     [isAdmin, conversations, showToast, refreshStorageStatuses]
   );
 
-  const handleSaveImageToDb = async (card: GeneratedImageCard, target: 'db' | 'bucket' = 'db') => {
+  const handleSaveImageToDb = async (
+    card: GeneratedImageCard,
+    target: 'db' | 'bucket' = 'db'
+  ): Promise<SaveImageResult> => {
     if (!isAdmin) {
-      showToast('请先登录管理员再保存资产');
-      return;
+      const msg = '请先登录管理员再保存或同步图片资产';
+      showToast(msg);
+      throw new Error(msg);
     }
     const filename = `image-${card.createdAt.slice(0, 10)}-${card.id.slice(0, 4)}.png`;
     if (target === 'bucket') {
@@ -1251,20 +1469,30 @@ export default function App() {
           contentData: card.dataUrl || card.url,
         }),
       });
-      if (res.ok) {
-        showToast('图片已存至对象存储桶 (R2/S3)');
-        refreshStorageStatuses();
-      } else {
-        showToast('保存存储桶失败，请检查存储桶连接状态灯');
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        key?: string;
+        item?: SavedAsset;
+        error?: string;
+      };
+      if (!res.ok) {
+        const errMsg = data.error || '保存存储桶失败，请检查存储桶连接状态灯';
+        showToast(errMsg);
+        throw new Error(errMsg);
       }
-      return;
+      refreshStorageStatuses();
+      return {
+        ok: true,
+        bucketKey: data.key || data.item?.bucket_key,
+        syncedAt: data.item?.updated_at || new Date().toISOString(),
+      };
     }
 
     const res = await fetch('/api/db/items', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        id: card.id,
+        id: card.dbAssetId || card.id,
         type: 'image',
         name: filename,
         mimeType: 'image/png',
@@ -1273,12 +1501,106 @@ export default function App() {
         contentData: card.dataUrl || card.url,
       }),
     });
-    if (res.ok) {
-      showToast('图片已保存到数据库并记录时间');
-      refreshStorageStatuses();
-    } else {
-      showToast('保存图片失败，请检查数据库连接');
+    const data = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      item?: SavedAsset;
+      error?: string;
+    };
+    if (!res.ok) {
+      const errMsg = data.error || '保存图片失败，请检查数据库连接';
+      showToast(errMsg);
+      throw new Error(errMsg);
     }
+    refreshStorageStatuses();
+    return {
+      ok: true,
+      dbAssetId: data.item?.id || card.dbAssetId || card.id,
+      syncedAt: data.item?.updated_at || new Date().toISOString(),
+    };
+  };
+
+  const handleDeleteSyncedImage = async (card: GeneratedImageCard): Promise<void> => {
+    if (!isAdmin) {
+      const msg = '请先登录管理员再删除云端图片资产';
+      showToast(msg);
+      throw new Error(msg);
+    }
+    if (card.bucketKey) {
+      const bRes = await fetch(`/api/bucket/items?key=${encodeURIComponent(card.bucketKey)}`, {
+        method: 'DELETE',
+      });
+      if (!bRes.ok) {
+        const bData = (await bRes.json().catch(() => ({}))) as { error?: string };
+        throw new Error(bData.error || '删除存储桶图片失败');
+      }
+    }
+    const targetDbId = card.dbAssetId || (card.savedToDb ? card.id : '');
+    if (targetDbId && !(card.bucketKey && targetDbId.startsWith('bkt_'))) {
+      const dRes = await fetch(`/api/db/items/${encodeURIComponent(targetDbId)}`, {
+        method: 'DELETE',
+      });
+      if (!dRes.ok) {
+        const dData = (await dRes.json().catch(() => ({}))) as { error?: string };
+        throw new Error(dData.error || '删除数据库图片记录失败');
+      }
+    }
+    refreshStorageStatuses();
+  };
+
+  const handlePullCloudImages = async (): Promise<GeneratedImageCard[]> => {
+    if (!isAdmin) {
+      const msg = '请先登录管理员后再从云端同步图片';
+      showToast(msg);
+      throw new Error(msg);
+    }
+    const res = await fetch('/api/db/items?type=image');
+    const data = (await res.json().catch(() => ({}))) as {
+      items?: SavedAsset[];
+      error?: string;
+    };
+    if (!res.ok) {
+      throw new Error(data.error || '拉取云端图片列表失败');
+    }
+    const rows = data.items || [];
+    const hydrated = await Promise.all(
+      rows.map(async (item): Promise<GeneratedImageCard | null> => {
+        let imgUrl = item.content_data || '';
+        if (
+          (!imgUrl.startsWith('data:image/') && !imgUrl.startsWith('http://') && !imgUrl.startsWith('https://')) &&
+          item.bucket_key
+        ) {
+          try {
+            const dl = await fetch(`/api/bucket/download?key=${encodeURIComponent(item.bucket_key)}`);
+            if (dl.ok) {
+              const blob = await dl.blob();
+              imgUrl = await blobToDataUrl(blob);
+            }
+          } catch {
+            // fallback skip unreadable bucket image
+          }
+        }
+        if (!imgUrl.startsWith('data:image/') && !imgUrl.startsWith('http://') && !imgUrl.startsWith('https://')) {
+          return null;
+        }
+        const isBucket = item.storage_location === 'bucket' || Boolean(item.bucket_key);
+        const isDb = item.storage_location !== 'bucket';
+        return {
+          id: item.id,
+          prompt: item.prompt || item.name || '云端同步图片',
+          finalPrompt: item.prompt || item.name || '云端同步图片',
+          modelId: item.model_id || 'cloud-synced',
+          url: imgUrl,
+          dataUrl: imgUrl.startsWith('data:') ? imgUrl : undefined,
+          createdAt: item.created_at || new Date().toISOString(),
+          savedToDb: isDb,
+          savedToBucket: isBucket,
+          dbAssetId: isDb ? item.id : undefined,
+          bucketKey: item.bucket_key || undefined,
+          syncedAt: item.updated_at || item.created_at,
+        };
+      })
+    );
+    return hydrated.filter((c): c is GeneratedImageCard => Boolean(c));
   };
 
   const handleSaveCodeToDb = async (code: string, lang: string, filename?: string) => {
@@ -2144,6 +2466,11 @@ export default function App() {
               bucketConnected={bucketStatus.connected}
               workersAiProvider={workersAiProvider}
               onSaveImageToDb={handleSaveImageToDb}
+              onDeleteSyncedImage={handleDeleteSyncedImage}
+              onPullCloudImages={handlePullCloudImages}
+              onShowToast={showToast}
+              onOpenAuthModal={() => setAuthModalOpen(true)}
+              onLimitAlert={(alert, handlers) => setLimitAlertState({ alert, ...handlers })}
             />
           ) : mode === 'connectors' && isAdmin ? (
             <ConnectorsWorkspace onShowToast={showToast} />
@@ -2396,6 +2723,18 @@ export default function App() {
         onClose={() => setExportModalOpen(false)}
         conversations={conversations}
         onExported={(name, count) => showToast(`已合并 ${count} 个会话导出为 ${name}`)}
+      />
+
+      <ModelLimitModal
+        alert={limitAlertState?.alert || null}
+        onClose={() => setLimitAlertState(null)}
+        onContinuePartial={limitAlertState?.onContinuePartial}
+        onRetryCurrent={limitAlertState?.onRetry}
+        onSwitchToRecommended={limitAlertState?.onSwitchModel}
+        onOpenSettings={() => {
+          setSettingsTab('providers');
+          setSettingsModalOpen(true);
+        }}
       />
     </div>
   );

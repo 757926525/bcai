@@ -1,6 +1,8 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
+  CloudDownload,
+  CloudUpload,
   Copy,
   Database,
   Dices,
@@ -9,6 +11,7 @@ import {
   Image as ImageIcon,
   Maximize2,
   Plus,
+  RefreshCw,
   RotateCcw,
   Settings2,
   SlidersHorizontal,
@@ -28,12 +31,35 @@ import {
   ImageProviderType,
 } from '../types';
 import { formatDateTime, loadLocalJson, saveLocalJson, uid } from '../utils/format';
+import {
+  clearGalleryImages,
+  loadGalleryImages,
+  removeGalleryImage,
+  upsertGalleryImage,
+} from '../utils/imageStore';
+import {
+  classifyLimitError,
+  ModelLimitAlert,
+  pickFallbackImageModel,
+} from '../utils/limitAlerts';
+
+export interface SaveImageResult {
+  ok: boolean;
+  dbAssetId?: string;
+  bucketKey?: string;
+  syncedAt?: string;
+}
 
 interface ImageWorkspaceProps {
   isAdmin: boolean;
   bucketConnected: boolean;
   workersAiProvider?: ExternalProvider;
-  onSaveImageToDb: (card: GeneratedImageCard, target?: 'db' | 'bucket') => Promise<void>;
+  onSaveImageToDb: (card: GeneratedImageCard, target?: 'db' | 'bucket') => Promise<SaveImageResult>;
+  onDeleteSyncedImage?: (card: GeneratedImageCard) => Promise<void>;
+  onPullCloudImages?: () => Promise<GeneratedImageCard[]>;
+  onShowToast?: (msg: string) => void;
+  onOpenAuthModal?: () => void;
+  onLimitAlert?: (alert: ModelLimitAlert, handlers?: { onRetry?: () => void; onSwitchModel?: (nextModelId: string) => void }) => void;
 }
 
 const LS_IMG_PROVIDERS = 'bcai.imageProviders.v1';
@@ -66,6 +92,11 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({
   bucketConnected,
   workersAiProvider,
   onSaveImageToDb,
+  onDeleteSyncedImage,
+  onPullCloudImages,
+  onShowToast,
+  onOpenAuthModal,
+  onLimitAlert,
 }) => {
   const [prompt, setPrompt] = useState('');
   const [negativePrompt, setNegativePrompt] = useState('');
@@ -79,9 +110,15 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({
   const [showAdvanced, setShowAdvanced] = useState(true);
   const [showExternalPanel, setShowExternalPanel] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [syncingAll, setSyncingAll] = useState(false);
+  const [pullingCloud, setPullingCloud] = useState(false);
+  const [savingCardId, setSavingCardId] = useState<string | null>(null);
+  const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [cards, setCards] = useState<GeneratedImageCard[]>([]);
   const [lightboxCard, setLightboxCard] = useState<GeneratedImageCard | null>(null);
   const [copiedPromptId, setCopiedPromptId] = useState<string | null>(null);
+  const galleryLoadedRef = useRef(false);
 
   const [externalImageProviders, setExternalImageProviders] = useState<ExternalImageProvider[]>(() => {
     const saved = loadLocalJson<ExternalImageProvider[]>(LS_IMG_PROVIDERS, []);
@@ -91,6 +128,24 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({
   useEffect(() => {
     saveLocalJson(LS_IMG_PROVIDERS, externalImageProviders);
   }, [externalImageProviders]);
+
+  // Load persisted generated images from IndexedDB on mount so switching tabs never loses images
+  useEffect(() => {
+    let cancelled = false;
+    loadGalleryImages().then((saved) => {
+      if (cancelled) return;
+      galleryLoadedRef.current = true;
+      if (saved.length > 0) {
+        setCards((prev) => {
+          const existingIds = new Set(prev.map((x) => x.id));
+          return [...prev, ...saved.filter((s) => !existingIds.has(s.id))];
+        });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Combined model options (built-in Pollinations zero-key + CF Workers AI + external endpoints)
   const externalModelOptions = useMemo(
@@ -164,11 +219,16 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({
     }
   };
 
-  const handleGenerate = async () => {
+  const generateWithParams = async (overrideModelId?: string) => {
     const clean = prompt.trim();
     if (!clean || busy) return;
 
-    const extProvider = selectedExternal?.provider;
+    const targetModelId = overrideModelId || modelId;
+    const extOption = externalModelOptions.find((m) => m.id === targetModelId);
+    const builtinOption = ORIGINAL_IMAGE_MODELS.find((m) => m.id === targetModelId);
+    const activeMeta = extOption || builtinOption || ORIGINAL_IMAGE_MODELS[0];
+    const extProvider = extOption?.provider;
+
     if (extProvider && !extProvider.apiKey.trim()) {
       setShowExternalPanel(true);
     }
@@ -176,10 +236,10 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({
     setBusy(true);
     const cardId = uid();
     const now = new Date().toISOString();
-    const effectiveModelName = extProvider ? selectedExternal.rawModelId : selectedMeta.id;
-    const effectiveProviderType: ImageProviderType = extProvider
-      ? extProvider.providerType
-      : selectedMeta.providerType;
+    const effectiveModelName = extOption ? extOption.rawModelId : activeMeta.id;
+    const effectiveProviderType: ImageProviderType = extOption
+      ? extOption.providerType
+      : activeMeta.providerType;
 
     setCards((prev) => [
       {
@@ -187,7 +247,7 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({
         prompt: clean,
         negativePrompt: negativePrompt.trim(),
         finalPrompt: clean,
-        modelId,
+        modelId: targetModelId,
         providerType: effectiveProviderType,
         stylePreset,
         size,
@@ -237,11 +297,12 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({
         } catch {
           // ignore
         }
-        throw new Error(msg);
+        const err = new Error(msg) as Error & { statusCode?: number };
+        err.statusCode = res.status;
+        throw err;
       }
 
       const blob = await res.blob();
-      const objUrl = URL.createObjectURL(blob);
       const dataUrl = await blobToDataUrl(blob);
       let finalPrompt = clean;
       let finalNegative = negativePrompt.trim();
@@ -253,36 +314,71 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({
         // keep clean
       }
 
-      setCards((prev) =>
-        prev.map((c) =>
-          c.id === cardId
-            ? {
-                ...c,
-                url: objUrl,
-                dataUrl,
-                finalPrompt,
-                negativePrompt: finalNegative,
-                loading: false,
-              }
-            : c
-        )
-      );
+      const completedCard: GeneratedImageCard = {
+        id: cardId,
+        prompt: clean,
+        negativePrompt: finalNegative,
+        finalPrompt,
+        modelId: targetModelId,
+        providerType: effectiveProviderType,
+        stylePreset,
+        size,
+        guidance,
+        seed: seed.trim() || undefined,
+        url: dataUrl,
+        dataUrl,
+        createdAt: now,
+        loading: false,
+      };
+
+      setCards((prev) => prev.map((c) => (c.id === cardId ? completedCard : c)));
+      await upsertGalleryImage(completedCard);
     } catch (err: any) {
+      const statusCode = Number(err?.statusCode) || undefined;
+      const msg = err?.message || '图像生成失败';
       setCards((prev) =>
         prev.map((c) =>
           c.id === cardId
             ? {
                 ...c,
                 loading: false,
-                error: err?.message || '图像生成失败',
+                error: msg,
               }
             : c
         )
       );
+
+      if (onLimitAlert) {
+        const alert = classifyLimitError({
+          scope: 'image',
+          rawMessage: msg,
+          statusCode,
+          modelId: effectiveModelName,
+          providerType: effectiveProviderType,
+        });
+        const rec = pickFallbackImageModel(targetModelId, ORIGINAL_IMAGE_MODELS);
+        if (rec) {
+          alert.recommendedModelId = rec.id;
+          alert.recommendedModelLabel = rec.name;
+        }
+        onLimitAlert(alert, {
+          onRetry: () => {
+            setCards((prev) => prev.filter((c) => c.id !== cardId));
+            generateWithParams(targetModelId);
+          },
+          onSwitchModel: (nextModelId) => {
+            handleModelChange(nextModelId);
+            setCards((prev) => prev.filter((c) => c.id !== cardId));
+            generateWithParams(nextModelId);
+          },
+        });
+      }
     } finally {
       setBusy(false);
     }
   };
+
+  const handleGenerate = () => generateWithParams();
 
   const handleRemixCard = (c: GeneratedImageCard) => {
     setPrompt(c.prompt);
@@ -294,19 +390,118 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({
     if (c.seed) setSeed(c.seed);
   };
 
-  const handleSave = async (card: GeneratedImageCard, target: 'db' | 'bucket') => {
-    await onSaveImageToDb(card, target);
-    setCards((prev) =>
-      prev.map((c) =>
-        c.id === card.id
-          ? {
-              ...c,
-              savedToDb: target === 'db' ? true : c.savedToDb,
-              savedToBucket: target === 'bucket' ? true : c.savedToBucket,
-            }
-          : c
-      )
+  const handleSave = async (card: GeneratedImageCard, target: 'db' | 'bucket'): Promise<boolean> => {
+    if (!isAdmin) {
+      onShowToast?.('同步或保存图片到云端需先登录管理员');
+      onOpenAuthModal?.();
+      return false;
+    }
+    setSavingCardId(card.id);
+    try {
+      const result = await onSaveImageToDb(card, target);
+      if (!result?.ok) return false;
+      const updatedCard: GeneratedImageCard = {
+        ...card,
+        savedToDb: target === 'db' ? true : card.savedToDb || Boolean(result.dbAssetId),
+        savedToBucket: target === 'bucket' ? true : card.savedToBucket,
+        dbAssetId: result.dbAssetId || card.dbAssetId || card.id,
+        bucketKey: result.bucketKey || card.bucketKey,
+        syncedAt: result.syncedAt || new Date().toISOString(),
+      };
+      setCards((prev) => prev.map((c) => (c.id === card.id ? updatedCard : c)));
+      if (lightboxCard?.id === card.id) {
+        setLightboxCard(updatedCard);
+      }
+      await upsertGalleryImage(updatedCard);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      setSavingCardId(null);
+    }
+  };
+
+  const handleSyncAllUnsynced = async (target: 'db' | 'bucket') => {
+    if (!isAdmin) {
+      onShowToast?.('同步全部图片需先登录管理员');
+      onOpenAuthModal?.();
+      return;
+    }
+    const unsynced = cards.filter(
+      (c) => !c.loading && !c.error && (c.dataUrl || c.url) && (target === 'db' ? !c.savedToDb : !c.savedToBucket)
     );
+    if (unsynced.length === 0) {
+      onShowToast?.(target === 'db' ? '当前全部图片均已同步至数据库' : '当前全部图片均已同步至存储桶');
+      return;
+    }
+    setSyncingAll(true);
+    let okCount = 0;
+    for (const c of unsynced) {
+      const ok = await handleSave(c, target);
+      if (ok) okCount++;
+      else break;
+    }
+    setSyncingAll(false);
+    if (okCount > 0) {
+      onShowToast?.(`已成功同步 ${okCount} 张图片至${target === 'db' ? '数据库' : '存储桶'}`);
+    }
+  };
+
+  const handlePullFromCloud = async () => {
+    if (!isAdmin) {
+      onShowToast?.('从云端拉取同步图片需先登录管理员');
+      onOpenAuthModal?.();
+      return;
+    }
+    if (!onPullCloudImages) return;
+    setPullingCloud(true);
+    try {
+      const cloudCards = await onPullCloudImages();
+      if (cloudCards.length === 0) {
+        onShowToast?.('云端数据库暂无可恢复的已同步图片');
+        return;
+      }
+      let addedCount = 0;
+      setCards((prev) => {
+        const existingKeys = new Set(prev.map((x) => x.dbAssetId || x.id));
+        const toAdd = cloudCards.filter((cc) => !existingKeys.has(cc.dbAssetId || cc.id));
+        addedCount = toAdd.length;
+        const merged = [...toAdd, ...prev].sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+        return merged;
+      });
+      for (const cc of cloudCards) {
+        await upsertGalleryImage(cc);
+      }
+      onShowToast?.(addedCount > 0 ? `已从云端同步恢复 ${addedCount} 张图片` : `云端图片 (${cloudCards.length} 张) 已在当前画廊中`);
+    } catch (err: any) {
+      onShowToast?.(err?.message || '从云端同步图片失败');
+    } finally {
+      setPullingCloud(false);
+    }
+  };
+
+  const handleDeleteCard = async (card: GeneratedImageCard, alsoDeleteCloud: boolean) => {
+    if (alsoDeleteCloud && (card.savedToDb || card.savedToBucket) && onDeleteSyncedImage) {
+      try {
+        await onDeleteSyncedImage(card);
+      } catch (err: any) {
+        onShowToast?.(err?.message || '删除云端记录失败');
+        return;
+      }
+    }
+    await removeGalleryImage(card.id);
+    setCards((prev) => prev.filter((c) => c.id !== card.id));
+    if (lightboxCard?.id === card.id) setLightboxCard(null);
+    setDeleteConfirmId(null);
+    onShowToast?.(alsoDeleteCloud ? '已从本机和云端删除该图片' : '已从本机画廊移除该图片');
+  };
+
+  const handleClearLocalGallery = async () => {
+    await clearGalleryImages();
+    setCards([]);
+    setLightboxCard(null);
+    setConfirmClearAll(false);
+    onShowToast?.('已清空本机生成的图片画廊（云端已同步记录不受影响）');
   };
 
   const handleCopyPrompt = (id: string, text: string) => {
@@ -315,6 +510,10 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({
       setTimeout(() => setCopiedPromptId(null), 1500);
     });
   };
+
+  const validCards = cards.filter((c) => !c.loading && !c.error && Boolean(c.url));
+  const unsyncedDbCount = validCards.filter((c) => !c.savedToDb).length;
+  const unsyncedBucketCount = validCards.filter((c) => !c.savedToBucket).length;
 
   return (
     <div className="flex-1 overflow-y-auto px-3 sm:px-5 py-4 sm:py-6">
@@ -634,108 +833,269 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({
           </div>
         </div>
 
+        {/* Gallery Sync & Management Toolbar */}
+        <div className="rounded-xl border wb-border wb-panel px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="flex items-center gap-2 wb-ink font-medium">
+            <ImageIcon className="w-4 h-4 wb-accent-text shrink-0" />
+            <span>
+              生成作品画廊（{cards.length} 张 · 已本机持久化）
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {onPullCloudImages && (
+              <button
+                type="button"
+                onClick={handlePullFromCloud}
+                disabled={pullingCloud}
+                className="h-8 px-2.5 rounded-lg border wb-border wb-bg wb-ink hover:opacity-80 inline-flex items-center gap-1.5 disabled:opacity-50 whitespace-nowrap"
+                title="从已绑定的 D1 / Turso / Supabase / Neon 数据库拉取历史图片"
+              >
+                {pullingCloud ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <CloudDownload className="w-3.5 h-3.5 wb-accent-text" />}
+                <span>{pullingCloud ? '拉取中…' : '从云端同步图片'}</span>
+              </button>
+            )}
+
+            {validCards.length > 0 && (
+              <button
+                type="button"
+                onClick={() => handleSyncAllUnsynced('db')}
+                disabled={syncingAll || unsyncedDbCount === 0}
+                className="h-8 px-2.5 rounded-lg border wb-border wb-bg wb-ink hover:opacity-80 inline-flex items-center gap-1.5 disabled:opacity-45 whitespace-nowrap"
+                title="把尚未上传的图片批量写入数据库"
+              >
+                <CloudUpload className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                <span>{unsyncedDbCount > 0 ? `全部同步至库 (${unsyncedDbCount})` : '已全部同步至库'}</span>
+              </button>
+            )}
+
+            {validCards.length > 0 && bucketConnected && (
+              <button
+                type="button"
+                onClick={() => handleSyncAllUnsynced('bucket')}
+                disabled={syncingAll || unsyncedBucketCount === 0}
+                className="h-8 px-2.5 rounded-lg border wb-border wb-bg wb-ink hover:opacity-80 inline-flex items-center gap-1.5 disabled:opacity-45 whitespace-nowrap"
+                title="把尚未上传的图片批量写入对象存储桶"
+              >
+                <HardDrive className="w-3.5 h-3.5 text-sky-600 dark:text-sky-400" />
+                <span>{unsyncedBucketCount > 0 ? `全部存桶 (${unsyncedBucketCount})` : '已全部存桶'}</span>
+              </button>
+            )}
+
+            {cards.length > 0 && (
+              confirmClearAll ? (
+                <div className="inline-flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={handleClearLocalGallery}
+                    className="h-8 px-2.5 rounded-lg bg-red-600 text-white font-medium whitespace-nowrap"
+                  >
+                    确认清空本机画廊
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmClearAll(false)}
+                    className="h-8 px-2 rounded-lg border wb-border wb-muted"
+                  >
+                    取消
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmClearAll(true)}
+                  className="h-8 px-2.5 rounded-lg border wb-border text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 inline-flex items-center gap-1 whitespace-nowrap"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>清空本机</span>
+                </button>
+              )
+            )}
+          </div>
+        </div>
+
         {/* Gallery */}
         {cards.length > 0 && (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {cards.map((c) => (
-              <div
-                key={c.id}
-                className="rounded-xl border wb-border wb-panel overflow-hidden flex flex-col"
-              >
-                <div className="aspect-square wb-code flex items-center justify-center overflow-hidden relative group">
-                  {c.loading ? (
-                    <div className="flex flex-col items-center gap-2 text-xs wb-muted">
-                      <span className="w-5 h-5 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
-                      <span>正在优化描述词并绘制画面…</span>
-                    </div>
-                  ) : c.error ? (
-                    <div className="p-4 text-center text-xs text-red-600 dark:text-red-400 break-words">{c.error}</div>
-                  ) : (
-                    <>
-                      <img
-                        src={c.url}
-                        alt={c.finalPrompt}
-                        referrerPolicy="no-referrer"
-                        onClick={() => setLightboxCard(c)}
-                        className="w-full h-full object-cover cursor-zoom-in transition-transform duration-200 group-hover:scale-[1.02]"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setLightboxCard(c)}
-                        className="absolute top-2 right-2 w-8 h-8 rounded-lg bg-slate-950/65 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                        title="大图高清查看"
-                      >
-                        <Maximize2 className="w-3.5 h-3.5" />
-                      </button>
-                    </>
-                  )}
-                </div>
-                <div className="p-3 space-y-2 text-xs flex-1 flex flex-col justify-between">
-                  <div>
-                    <p className="wb-ink line-clamp-2" title={c.finalPrompt}>
-                      {c.finalPrompt}
-                    </p>
-                    {c.negativePrompt && (
-                      <p className="wb-muted text-[11px] line-clamp-1 mt-0.5">
-                        负向词: {c.negativePrompt}
-                      </p>
-                    )}
-                    <p className="wb-muted mt-1 tabular-nums text-[11px]">
-                      {formatDateTime(c.createdAt)}
-                      {c.size ? ` · ${c.size}` : ''}
-                      {c.seed ? ` · Seed ${c.seed}` : ''}
-                    </p>
-                  </div>
-                  {!c.loading && !c.error && (
-                    <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t wb-border">
-                      <div className="flex items-center gap-2.5">
-                        <a
-                          href={c.url}
-                          download={`bcai-${Date.now()}.png`}
-                          className="inline-flex items-center gap-1 wb-accent-text hover:underline font-medium min-h-[32px]"
-                        >
-                          <Download className="w-3.5 h-3.5" />
-                          <span>下载</span>
-                        </a>
+            {cards.map((c) => {
+              const isSynced = Boolean(c.savedToDb || c.savedToBucket);
+              const confirmingDel = deleteConfirmId === c.id;
+              return (
+                <div
+                  key={c.id}
+                  className="rounded-xl border wb-border wb-panel overflow-hidden flex flex-col"
+                >
+                  <div className="aspect-square wb-code flex items-center justify-center overflow-hidden relative group">
+                    {c.loading ? (
+                      <div className="flex flex-col items-center gap-2 text-xs wb-muted">
+                        <span className="w-5 h-5 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
+                        <span>正在优化描述词并绘制画面…</span>
+                      </div>
+                    ) : c.error ? (
+                      <div className="p-4 text-center text-xs text-red-600 dark:text-red-400 break-words space-y-2">
+                        <div>{c.error}</div>
                         <button
                           type="button"
-                          onClick={() => handleRemixCard(c)}
-                          className="inline-flex items-center gap-1 wb-ink hover:wb-accent-text font-medium min-h-[32px]"
-                          title="把该图的提示词、模型、风格、比例与 Seed 一键填回上方参数区"
+                          onClick={() => handleDeleteCard(c, false)}
+                          className="px-2.5 py-1 rounded border border-red-400/40 text-[11px] hover:bg-red-500/10"
                         >
-                          <RotateCcw className="w-3.5 h-3.5" />
-                          <span>复用重绘</span>
+                          移除此记录
                         </button>
                       </div>
-                      {isAdmin && (
+                    ) : (
+                      <>
+                        <img
+                          src={c.url}
+                          alt={c.finalPrompt}
+                          referrerPolicy="no-referrer"
+                          onClick={() => setLightboxCard(c)}
+                          className="w-full h-full object-cover cursor-zoom-in transition-transform duration-200 group-hover:scale-[1.02]"
+                        />
+                        <div className="absolute top-2 right-2 flex items-center gap-1 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
+                          <button
+                            type="button"
+                            onClick={() => setLightboxCard(c)}
+                            className="w-8 h-8 rounded-lg bg-slate-950/70 text-white flex items-center justify-center hover:bg-slate-950"
+                            title="大图高清查看"
+                          >
+                            <Maximize2 className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (isSynced) setDeleteConfirmId(confirmingDel ? null : c.id);
+                              else handleDeleteCard(c, false);
+                            }}
+                            className="w-8 h-8 rounded-lg bg-slate-950/70 text-white hover:bg-red-600 flex items-center justify-center"
+                            title="删除图片"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                        {/* Sync Status Badge */}
+                        <div className="absolute bottom-2 left-2 flex flex-wrap gap-1 pointer-events-none">
+                          {c.savedToDb && (
+                            <span className="px-2 py-0.5 rounded bg-emerald-600/90 text-white text-[10px] font-medium">
+                              已同步库
+                            </span>
+                          )}
+                          {c.savedToBucket && (
+                            <span className="px-2 py-0.5 rounded bg-sky-600/90 text-white text-[10px] font-medium">
+                              已同步桶
+                            </span>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                  <div className="p-3 space-y-2 text-xs flex-1 flex flex-col justify-between">
+                    <div>
+                      <p className="wb-ink line-clamp-2" title={c.finalPrompt}>
+                        {c.finalPrompt}
+                      </p>
+                      {c.negativePrompt && (
+                        <p className="wb-muted text-[11px] line-clamp-1 mt-0.5">
+                          负向词: {c.negativePrompt}
+                        </p>
+                      )}
+                      <p className="wb-muted mt-1 tabular-nums text-[11px]">
+                        {formatDateTime(c.createdAt)}
+                        {c.size ? ` · ${c.size}` : ''}
+                        {c.seed ? ` · Seed ${c.seed}` : ''}
+                      </p>
+                    </div>
+
+                    {confirmingDel && (
+                      <div className="p-2 rounded-lg border border-red-400/40 bg-red-50/70 dark:bg-red-950/30 space-y-1.5">
+                        <div className="text-[11px] text-red-700 dark:text-red-300 font-medium">
+                          此图片已同步云端，请选择删除方式：
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteCard(c, true)}
+                            className="px-2 py-1 rounded bg-red-600 text-white text-[11px] font-medium"
+                          >
+                            本机与云端同步删除
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteCard(c, false)}
+                            className="px-2 py-1 rounded border wb-border wb-panel wb-ink text-[11px]"
+                          >
+                            仅删本机
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDeleteConfirmId(null)}
+                            className="px-2 py-1 text-[11px] wb-muted"
+                          >
+                            取消
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {!c.loading && !c.error && (
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t wb-border">
+                        <div className="flex items-center gap-2.5">
+                          <a
+                            href={c.url}
+                            download={`bcai-${c.id.slice(0, 8)}.png`}
+                            className="inline-flex items-center gap-1 wb-accent-text hover:underline font-medium min-h-[30px]"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            <span>下载</span>
+                          </a>
+                          <button
+                            type="button"
+                            onClick={() => handleRemixCard(c)}
+                            className="inline-flex items-center gap-1 wb-ink hover:wb-accent-text font-medium min-h-[30px]"
+                            title="把该图的提示词、模型、风格、比例与 Seed 一键填回上方参数区"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            <span>复用重绘</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (isSynced) setDeleteConfirmId(confirmingDel ? null : c.id);
+                              else handleDeleteCard(c, false);
+                            }}
+                            className="inline-flex items-center gap-1 text-red-600 dark:text-red-400 hover:underline font-medium min-h-[30px]"
+                            title="删除该图片"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>删除</span>
+                          </button>
+                        </div>
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
-                            disabled={c.savedToDb}
+                            disabled={c.savedToDb || savingCardId === c.id}
                             onClick={() => handleSave(c, 'db')}
-                            className="inline-flex items-center gap-1 wb-ink hover:wb-accent-text disabled:text-emerald-600 font-medium min-h-[32px]"
+                            className="inline-flex items-center gap-1 wb-ink hover:wb-accent-text disabled:text-emerald-600 font-medium min-h-[30px]"
                           >
                             <Database className="w-3.5 h-3.5" />
-                            <span>{c.savedToDb ? '已存D1' : '存库'}</span>
+                            <span>{savingCardId === c.id ? '同步中…' : c.savedToDb ? '已同步库' : '同步库'}</span>
                           </button>
                           {bucketConnected && (
                             <button
                               type="button"
-                              disabled={c.savedToBucket}
+                              disabled={c.savedToBucket || savingCardId === c.id}
                               onClick={() => handleSave(c, 'bucket')}
-                              className="inline-flex items-center gap-1 wb-ink hover:wb-accent-text disabled:text-emerald-600 font-medium min-h-[32px]"
+                              className="inline-flex items-center gap-1 wb-ink hover:wb-accent-text disabled:text-sky-600 font-medium min-h-[30px]"
                             >
                               <HardDrive className="w-3.5 h-3.5" />
                               <span>{c.savedToBucket ? '已存桶' : '存桶'}</span>
                             </button>
                           )}
                         </div>
-                      )}
-                    </div>
-                  )}
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
@@ -754,13 +1114,28 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({
               <div className="text-xs sm:text-sm font-semibold wb-ink truncate">
                 高清图像详情 · {lightboxCard.modelId} {lightboxCard.size ? `(${lightboxCard.size})` : ''}
               </div>
-              <button
-                type="button"
-                onClick={() => setLightboxCard(null)}
-                className="w-8 h-8 rounded-lg flex items-center justify-center wb-muted hover:bg-black/5 dark:hover:bg-white/5"
-              >
-                <X className="w-4 h-4" />
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleDeleteCard(
+                      lightboxCard,
+                      Boolean(lightboxCard.savedToDb || lightboxCard.savedToBucket)
+                    )
+                  }
+                  className="h-8 px-2.5 rounded-lg border border-red-400/40 text-red-600 dark:text-red-400 hover:bg-red-500/10 text-xs inline-flex items-center gap-1"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>{lightboxCard.savedToDb || lightboxCard.savedToBucket ? '删除(含云端)' : '删除图片'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLightboxCard(null)}
+                  className="w-8 h-8 rounded-lg flex items-center justify-center wb-muted hover:bg-black/5 dark:hover:bg-white/5"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             </div>
             <div className="flex-1 min-h-0 overflow-auto bg-slate-900/90 flex items-center justify-center p-3">
               <img

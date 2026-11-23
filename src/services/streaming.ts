@@ -1,11 +1,12 @@
 import { ChatAttachment, ExternalProvider, ProviderStatusInfo } from '../types';
 
 export interface StreamMetaEvent {
-  phase?: 'connecting' | 'thinking' | 'writing' | 'fallback' | 'truncated' | 'done';
+  phase?: 'connecting' | 'thinking' | 'writing' | 'fallback' | 'truncated' | 'blocked' | 'done';
   model?: string;
   fromModel?: string;
   finishReason?: string;
   truncated?: boolean;
+  limitNotice?: string;
 }
 
 export interface StreamDoneResult {
@@ -13,6 +14,21 @@ export interface StreamDoneResult {
   interrupted: boolean;
   finishReason?: string;
   activeModel?: string;
+  limitNotice?: string;
+}
+
+export class StreamHttpError extends Error {
+  status?: number;
+  modelId?: string;
+  providerType?: string;
+
+  constructor(message: string, status?: number, modelId?: string, providerType?: string) {
+    super(message);
+    this.name = 'StreamHttpError';
+    this.status = status;
+    this.modelId = modelId;
+    this.providerType = providerType;
+  }
 }
 
 export interface StreamCallbacks {
@@ -137,9 +153,9 @@ export async function probeProviderConnection(
   }
 }
 
-class UpstreamStreamError extends Error {
-  constructor(message: string) {
-    super(message);
+class UpstreamStreamError extends StreamHttpError {
+  constructor(message: string, status?: number, modelId?: string, providerType?: string) {
+    super(message, status, modelId, providerType);
     this.name = 'UpstreamStreamError';
   }
 }
@@ -235,11 +251,16 @@ export async function streamChatCompletion(params: {
       } catch {
         // use raw text
       }
-      throw new Error(errText.slice(0, 320) || `请求失败 (HTTP ${res.status})`);
+      throw new StreamHttpError(
+        errText.slice(0, 320) || `请求失败 (HTTP ${res.status})`,
+        res.status,
+        modelId,
+        provider?.providerType
+      );
     }
 
     if (!res.body) {
-      throw new Error('响应体为空，无法读取流式数据');
+      throw new StreamHttpError('响应体为空，无法读取流式数据', res.status, modelId, provider?.providerType);
     }
 
     const reader = res.body.getReader();
@@ -248,6 +269,7 @@ export async function streamChatCompletion(params: {
     let receivedDone = false;
     let truncated = false;
     let finishReason: string | undefined;
+    let limitNotice: string | undefined;
     let activeModel = modelId;
     let receivedContent = false;
     let inReasoningBlock = false;
@@ -275,7 +297,9 @@ export async function streamChatCompletion(params: {
       }
 
       if (json?.error) {
-        throw new UpstreamStreamError(typeof json.error === 'string' ? json.error : json.error.message || '模型返回错误');
+        const errMsg = typeof json.error === 'string' ? json.error : json.error.message || '模型返回错误';
+        const errCode = typeof json.error === 'object' ? Number(json.error.code || json.error.status) || undefined : undefined;
+        throw new UpstreamStreamError(errMsg, errCode, activeModel, provider?.providerType);
       }
 
       if (json?.meta) {
@@ -283,6 +307,7 @@ export async function streamChatCompletion(params: {
         if (meta.model) activeModel = meta.model;
         if (meta.finishReason) finishReason = meta.finishReason;
         if (meta.truncated) truncated = true;
+        if (meta.limitNotice) limitNotice = meta.limitNotice;
         callbacks.onMeta?.(meta);
         return;
       }
@@ -294,6 +319,9 @@ export async function streamChatCompletion(params: {
         if (lowFinish === 'length' || lowFinish === 'max_tokens') {
           truncated = true;
           callbacks.onMeta?.({ phase: 'truncated', finishReason, truncated: true, model: activeModel });
+        } else if (lowFinish === 'content_filter' || lowFinish === 'safety' || lowFinish === 'recitation') {
+          limitNotice = `触发模型安全/合规策略限制 (${finishReason})`;
+          callbacks.onMeta?.({ phase: 'blocked', finishReason, limitNotice, model: activeModel });
         }
       }
 
@@ -344,12 +372,13 @@ export async function streamChatCompletion(params: {
       callbacks.onChunk('\n</think>\n\n');
     }
 
-    const interrupted = !receivedDone && !signal.aborted && receivedContent;
+    const interrupted = (!receivedDone && !signal.aborted) || (!receivedContent && !signal.aborted);
     callbacks.onDone({
       truncated,
       interrupted,
       finishReason,
       activeModel,
+      limitNotice,
     });
   } catch (err: any) {
     callbacks.onError(err instanceof Error ? err : new Error(String(err)));

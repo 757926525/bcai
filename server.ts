@@ -973,7 +973,7 @@ async function createServer() {
         const buildGeminiConfig = (targetModel: string) => {
           const isG4 = targetModel.startsWith('gemini-4');
           const cfg: Record<string, unknown> = {
-            maxOutputTokens: 32768,
+            maxOutputTokens: isG4 ? 65536 : 32768,
           };
           if (systemMsg) cfg.systemInstruction = systemMsg;
           if (targetModel === 'gemini-4-hydrogen') {
@@ -1015,6 +1015,7 @@ async function createServer() {
           const iterator = activeStream[Symbol.asyncIterator]();
           let receivedText = false;
           let finishReason: string | undefined;
+          const chunkStallTimeoutMs = 45000;
 
           if (targetModel.startsWith('gemini-4')) {
             writeSse({ meta: { phase: 'thinking', model: targetModel } });
@@ -1022,18 +1023,15 @@ async function createServer() {
 
           while (!ac.signal.aborted) {
             const nextPromise = iterator.next();
-            const step =
-              !receivedText && firstChunkTimeoutMs
-                ? await Promise.race([
-                    nextPromise,
-                    new Promise<never>((_, reject) =>
-                      setTimeout(
-                        () => reject(new Error('503 UNAVAILABLE: Gemini first chunk timeout')),
-                        firstChunkTimeoutMs
-                      )
-                    ),
-                  ])
-                : await nextPromise;
+            const activeTimeout = !receivedText && firstChunkTimeoutMs ? firstChunkTimeoutMs : chunkStallTimeoutMs;
+            const timeoutLabel = !receivedText && firstChunkTimeoutMs
+              ? '503 UNAVAILABLE: Gemini first chunk timeout'
+              : '模型流式响应超时（超过 45 秒未返回新数据）';
+
+            const step = await Promise.race([
+              nextPromise,
+              new Promise<never>((_, reject) => setTimeout(() => reject(new Error(timeoutLabel)), activeTimeout)),
+            ]);
 
             if (step.done) break;
             const chunk = step.value;
@@ -1059,6 +1057,7 @@ async function createServer() {
         };
 
         let finishReason: string | undefined;
+        let streamErrored = false;
         try {
           const result = await consumeGeminiStream(
             effectiveModel,
@@ -1075,27 +1074,58 @@ async function createServer() {
           if (effectiveModel === 'gemini-4-hydrogen' && isOverloaded && !ac.signal.aborted) {
             const fromModel = effectiveModel;
             effectiveModel = 'gemini-3.1-flash-lite';
-            writeSse({ meta: { phase: 'fallback', fromModel, model: effectiveModel } });
+            writeSse({
+              meta: {
+                phase: 'fallback',
+                fromModel,
+                model: effectiveModel,
+                limitNotice: `${fromModel} 当前高负载或响应超时，已自动切换至 ${effectiveModel}`,
+              },
+            });
             try {
               const fallbackRes = await consumeGeminiStream(effectiveModel);
               finishReason = fallbackRes.finishReason;
             } catch (fallbackErr: any) {
+              streamErrored = true;
               writeSse({ error: formatFriendlyGeminiError(fallbackErr) });
             }
           } else if (!ac.signal.aborted) {
+            streamErrored = true;
             writeSse({ error: formatFriendlyGeminiError(geminiErr) });
           }
         } finally {
           stopHeartbeat();
         }
 
-        if (finishReason === 'MAX_TOKENS') {
-          writeSse({ meta: { phase: 'truncated', finishReason, truncated: true, model: effectiveModel } });
-        } else {
-          writeSse({ meta: { phase: 'done', finishReason: finishReason || 'STOP', model: effectiveModel } });
+        if (!streamErrored) {
+          const abnormalStopReasons = new Set([
+            'SAFETY',
+            'RECITATION',
+            'BLOCKLIST',
+            'PROHIBITED_CONTENT',
+            'SPII',
+            'MALFORMED_FUNCTION_CALL',
+            'OTHER',
+          ]);
+          if (finishReason === 'MAX_TOKENS') {
+            writeSse({ meta: { phase: 'truncated', finishReason, truncated: true, model: effectiveModel } });
+          } else if (finishReason && abnormalStopReasons.has(finishReason.toUpperCase())) {
+            writeSse({
+              meta: {
+                phase: 'blocked',
+                finishReason,
+                model: effectiveModel,
+                limitNotice: `模型触发限制中止输出 (${finishReason})`,
+              },
+            });
+          } else {
+            writeSse({ meta: { phase: 'done', finishReason: finishReason || 'STOP', model: effectiveModel } });
+          }
+          if (!res.writableEnded) {
+            res.write('data: [DONE]\n\n');
+          }
         }
         if (!res.writableEnded) {
-          res.write('data: [DONE]\n\n');
           res.end();
         }
         return;

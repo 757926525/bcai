@@ -158,12 +158,17 @@ export const ConnectorsWorkspace: React.FC<ConnectorsWorkspaceProps> = ({ onShow
       status: 'unconfigured',
       updatedAt: new Date().toISOString(),
     };
-    const r = await fetch('/api/connectors', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    if (r.ok) {
+    try {
+      const r = await fetch('/api/connectors', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        const d = (await r.json().catch(() => ({}))) as { error?: string };
+        onShowToast(d.error || '保存连接器失败');
+        return;
+      }
       setEditing(false);
       setSecretToken('');
       setUsernameOrId('');
@@ -171,6 +176,8 @@ export const ConnectorsWorkspace: React.FC<ConnectorsWorkspaceProps> = ({ onShow
       onShowToast(`已保存连接器：${payload.name}`);
       await loadConnectors();
       handleProbe(payload);
+    } catch {
+      onShowToast('保存连接器失败，请检查网络连接');
     }
   };
 
@@ -202,7 +209,12 @@ export const ConnectorsWorkspace: React.FC<ConnectorsWorkspaceProps> = ({ onShow
   };
 
   const handleDelete = async (id: string) => {
-    await fetch(`/api/connectors/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    const r = await fetch(`/api/connectors/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (!r.ok) {
+      const d = (await r.json().catch(() => ({}))) as { error?: string };
+      onShowToast(d.error || '删除连接器失败');
+      return;
+    }
     setItems((prev) => prev.filter((x) => x.id !== id));
     onShowToast('已删除连接器');
   };

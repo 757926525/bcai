@@ -200,10 +200,36 @@ export function suggestCodeFilename(lang: string, index: number, explicitFilenam
 
 export interface ProjectCompletenessReport {
   incomplete: boolean;
-  reason: 'truncated' | 'interrupted' | 'unclosed_fence' | 'unclosed_think' | 'abrupt_end' | 'missing_planned_files' | 'complete';
+  reason:
+    | 'truncated'
+    | 'interrupted'
+    | 'blocked'
+    | 'unclosed_fence'
+    | 'unclosed_think'
+    | 'abrupt_end'
+    | 'missing_planned_files'
+    | 'complete';
   detail: string;
   writtenFiles: string[];
   missingFiles: string[];
+}
+
+const ABNORMAL_STOP_REASONS = new Set([
+  'safety',
+  'recitation',
+  'blocklist',
+  'prohibited_content',
+  'content_filter',
+  'spii',
+  'malformed_function_call',
+  'other',
+]);
+
+function isNonFileMention(candidate: string): boolean {
+  const low = candidate.toLowerCase();
+  if (/^(?:e\.g|i\.e|etc\.a|v\d+\.\d+)$/i.test(low)) return true;
+  if (/^\d+\.\d+/.test(low)) return true;
+  return false;
 }
 
 export function analyzeProjectCompleteness(
@@ -214,6 +240,18 @@ export function analyzeProjectCompleteness(
   const trimmed = (markdown || '').trim();
   const blocks = extractCodeBlocks(trimmed);
   const writtenFiles = blocks.map((b, i) => suggestCodeFilename(b.lang, i, b.filename));
+  const fr = (streamResult?.finishReason || '').trim();
+  const frLow = fr.toLowerCase();
+
+  if (frLow && ABNORMAL_STOP_REASONS.has(frLow)) {
+    return {
+      incomplete: true,
+      reason: 'blocked',
+      detail: `模型因策略/异常原因中止输出 (${fr})`,
+      writtenFiles,
+      missingFiles: [],
+    };
+  }
 
   if (!trimmed) {
     return {
@@ -286,9 +324,40 @@ export function analyzeProjectCompleteness(
     };
   }
 
-  // Detect if the model explicitly listed multiple project files in its intro/tree before code blocks,
-  // wrote some of them, and ended right on a code fence or mid-project without finishing the remaining planned files.
+  // Detect incomplete HTML or truncated last code block even when model closed the fence (common in Workers AI)
   if ((mode === 'code' || mode === 'repo') && blocks.length > 0) {
+    const lastBlock = blocks[blocks.length - 1];
+    const lastCodeTrim = lastBlock.code.trim();
+    const isHtmlBlock = lastBlock.lang.toLowerCase() === 'html' || Boolean(lastBlock.filename?.endsWith('.html'));
+    if (
+      isHtmlBlock &&
+      /^(?:<!doctype|<html\b)/i.test(lastCodeTrim) &&
+      !/<\/html>\s*$/i.test(lastCodeTrim)
+    ) {
+      return {
+        incomplete: true,
+        reason: 'abrupt_end',
+        detail: `HTML 模块 (${lastBlock.filename || 'index.html'}) 缺少 </html> 闭合，疑为模型隐式截断`,
+        writtenFiles,
+        missingFiles: [],
+      };
+    }
+
+    const tailCodeLine = (lastCodeTrim.split('\n').pop() || '').trim();
+    if (
+      tailCodeLine &&
+      (/(?:其余代码省略|剩余代码略|此处省略|rest of code omitted|implementation continues|todo:\s*complete)/i.test(tailCodeLine) ||
+        /[{\(=\\]$/.test(tailCodeLine))
+    ) {
+      return {
+        incomplete: true,
+        reason: 'abrupt_end',
+        detail: `最后一个代码块 (${suggestCodeFilename(lastBlock.lang, blocks.length - 1, lastBlock.filename)}) 结尾未完整闭合`,
+        writtenFiles,
+        missingFiles: [],
+      };
+    }
+
     const firstFencePos = withoutThink.indexOf('```');
     const introText = firstFencePos > 0 ? withoutThink.slice(0, firstFencePos) : '';
     const lastFenceEnd = withoutThink.lastIndexOf('```');
@@ -296,29 +365,26 @@ export function analyzeProjectCompleteness(
 
     // Find explicit project file names mentioned in the intro structure (e.g. src/App.tsx, package.json)
     const plannedSet = new Set<string>();
-    const fileMentionRe = /(?:^|[\s`"'(\[├──└│])+((?:[a-zA-Z0-9_-]+\/)*[a-zA-Z0-9._-]+\.(?:tsx?|jsx?|mjs|cjs|html|css|scss|json|py|go|rs|vue|svelte|sql|yml|yaml))/gm;
+    const fileMentionRe =
+      /(?:^|[\s`"'(\[├──└│])+((?:[a-zA-Z0-9_-]+\/)*[a-zA-Z0-9._-]+\.(?:tsx?|jsx?|mjs|cjs|html|css|scss|json|py|go|rs|vue|svelte|sql|yml|yaml))/gm;
     let fm: RegExpExecArray | null;
     while ((fm = fileMentionRe.exec(introText)) !== null) {
       const candidate = fm[1].replace(/^\/+/, '');
-      if (candidate && !candidate.includes('..') && candidate.length <= 80) {
+      if (candidate && !candidate.includes('..') && candidate.length <= 80 && !isNonFileMention(candidate)) {
         plannedSet.add(candidate);
       }
     }
 
-    const writtenNormalized = new Set(
-      writtenFiles.map((f) => f.toLowerCase())
-    );
-    const writtenBasenames = new Set(
-      writtenFiles.map((f) => (f.split('/').pop() || f).toLowerCase())
-    );
+    const writtenNormalized = new Set(writtenFiles.map((f) => f.toLowerCase()));
+    const writtenBasenames = new Set(writtenFiles.map((f) => (f.split('/').pop() || f).toLowerCase()));
     const missingFiles = Array.from(plannedSet).filter((pf) => {
       const low = pf.toLowerCase();
       const base = (pf.split('/').pop() || pf).toLowerCase();
       return !writtenNormalized.has(low) && !writtenBasenames.has(base);
     });
 
-    // Only treat as incomplete if there is no concluding prose (stopped right at code block end) and planned files remain
-    if (missingFiles.length > 0 && trailingProse.length < 40) {
+    // Trigger continuation if planned project files remain and trailing prose looks short/non-concluding
+    if (missingFiles.length > 0 && trailingProse.length < 60) {
       return {
         incomplete: true,
         reason: 'missing_planned_files',
@@ -339,6 +405,60 @@ export function analyzeProjectCompleteness(
 }
 
 /**
+ * Builds a clean continuation context tail without breaking Markdown fence parity in the middle of an earlier block.
+ */
+export function buildCleanContinuationTail(
+  markdown: string,
+  maxChars = 14000
+): { tailText: string; fenceStateNote: string } {
+  const blocks = extractCodeBlocks(markdown);
+  const lastBlock = blocks[blocks.length - 1];
+  const insideOpenFence = Boolean(lastBlock && !lastBlock.closed);
+
+  if (markdown.length <= maxChars) {
+    return {
+      tailText: markdown,
+      fenceStateNote: insideOpenFence
+        ? `当前光标正处于未闭合代码块内部（文件/语言：${lastBlock.filename || lastBlock.lang}），请直接继续编写后续代码行并在末尾用 \`\`\` 闭合，切勿重复开头。`
+        : '前文所有代码块均已闭合，请直接从下一个未写出的模块/文件或收尾说明继续输出。',
+    };
+  }
+
+  let cutStart = markdown.length - maxChars;
+  // Find nearest newline after cutStart
+  const nlAfter = markdown.indexOf('\n', cutStart);
+  if (nlAfter > cutStart && nlAfter - cutStart < 600) {
+    cutStart = nlAfter + 1;
+  }
+
+  let tail = markdown.slice(cutStart);
+  // Count fence lines inside tail; if parity mismatches insideOpenFence, anchor cleanly at the next fence header or close stale marker
+  const fenceMatches = tail.match(/^```/gm) || [];
+  const tailHasOddFences = fenceMatches.length % 2 === 1;
+
+  if (insideOpenFence && !tailHasOddFences) {
+    const label = lastBlock.filename ? `${lastBlock.lang} ${lastBlock.filename}` : lastBlock.lang;
+    tail = `\`\`\`${label}\n// ...（已接续前文部分代码）\n${tail}`;
+  } else if (!insideOpenFence && tailHasOddFences) {
+    // We started inside an already-closed block; advance to just after its closing ```
+    const firstFenceEnd = tail.indexOf('```');
+    if (firstFenceEnd >= 0) {
+      const nextNl = tail.indexOf('\n', firstFenceEnd + 3);
+      if (nextNl >= 0) {
+        tail = tail.slice(nextNl + 1);
+      }
+    }
+  }
+
+  return {
+    tailText: tail,
+    fenceStateNote: insideOpenFence
+      ? `当前光标正处于未闭合代码块内部（文件/语言：${lastBlock.filename || lastBlock.lang}），请直接紧接末尾继续输出剩余代码并在写完后用 \`\`\` 闭合，切勿重写前文代码或重开 \`\`\`。`
+      : '前文代码块均已闭合，请直接继续生成剩余文件与内容。',
+  };
+}
+
+/**
  * Strips leading duplicated code fences and overlapping suffix/prefix lines when seamlessly merging
  * an auto-continuation chunk onto existing generated content.
  */
@@ -355,12 +475,15 @@ export function trimContinuationPrefix(
   }
 
   if (wasInsideUnclosedFence) {
-    // Strip redundant opening fence like ```tsx or ```ts src/App.tsx
-    clean = clean.replace(/^\s*```[^\n]*\n?/, '');
+    // Strip optional brief preamble line + redundant opening fence like ```tsx or ```ts src/App.tsx
+    clean = clean.replace(/^(?:[^\n`]{0,50}[：:]\s*\n)?\s*```[^\n]*\n?/, '');
   }
 
+  // Strip leading ellipsis echoes if model mimicked `...`
+  clean = clean.replace(/^\.\.\.\s*\n?/, '');
+
   // Trim exact character overlap between tail of existing and head of clean (min 18 chars)
-  const existingTail = existing.slice(-400);
+  const existingTail = existing.slice(-600);
   const maxCheck = Math.min(existingTail.length, clean.length);
   for (let len = maxCheck; len >= 18; len--) {
     if (existingTail.endsWith(clean.slice(0, len))) {

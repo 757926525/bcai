@@ -10,6 +10,7 @@ import {
   type ExternalDbConfig,
   dbProviderLabel,
   deleteExternalDbAsset,
+  deleteExternalDbAssetByBucketKey,
   fetchExternalDbConversations,
   listExternalDbAssets,
   syncExternalDbConversations,
@@ -772,6 +773,10 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
         upstream = await callCfRest(4096);
         if (upstream.status === 400) upstream = await callCfRest(undefined);
       }
+      if (!upstream.ok || !upstream.body) {
+        const errTxt = await upstream.text().catch(() => '');
+        return jsonRes({ error: errTxt.slice(0, 320) || `Workers AI HTTP ${upstream.status}` }, upstream.status);
+      }
       return new Response(upstream.body, {
         status: upstream.status,
         headers: { 'content-type': upstream.headers.get('content-type') || 'text/event-stream; charset=utf-8' },
@@ -811,8 +816,9 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
 
       const callGeminiEdge = async (targetModel: string) => {
         const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(targetModel)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`;
+        const isG4 = targetModel.startsWith('gemini-4');
         const generationConfig: Record<string, unknown> = {
-          maxOutputTokens: 32768,
+          maxOutputTokens: isG4 ? 65536 : 32768,
         };
         if (targetModel === 'gemini-4-hydrogen') {
           generationConfig.thinkingConfig = { thinkingLevel: 'MEDIUM' };
@@ -828,13 +834,16 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
         });
       };
 
+      const initialModel = effectiveModel;
+      let fallbackFromModel: string | undefined;
       let upstream = await callGeminiEdge(effectiveModel);
       if ((!upstream.ok || !upstream.body) && effectiveModel === 'gemini-4-hydrogen' && (upstream.status === 503 || upstream.status === 429)) {
+        fallbackFromModel = initialModel;
         effectiveModel = 'gemini-3.1-flash-lite';
         upstream = await callGeminiEdge(effectiveModel);
       }
       if (!upstream.ok || !upstream.body) {
-        return jsonRes({ error: (await upstream.text()) || 'Gemini 请求失败' }, upstream.status);
+        return jsonRes({ error: (await upstream.text().catch(() => '')) || 'Gemini 请求失败' }, upstream.status);
       }
       const transform = new TransformStream();
       const writer = transform.writable.getWriter();
@@ -872,7 +881,22 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
           }
         };
         try {
-          await writer.write(encoder.encode(`data: ${JSON.stringify({ meta: { phase: 'connecting', model: effectiveModel } })}\n\n`));
+          if (fallbackFromModel) {
+            await writer.write(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  meta: {
+                    phase: 'fallback',
+                    fromModel: fallbackFromModel,
+                    model: effectiveModel,
+                    limitNotice: `${fallbackFromModel} 当前高负载或受限，已自动切换至 ${effectiveModel}`,
+                  },
+                })}\n\n`
+              )
+            );
+          } else {
+            await writer.write(encoder.encode(`data: ${JSON.stringify({ meta: { phase: 'connecting', model: effectiveModel } })}\n\n`));
+          }
           while (true) {
             const { value, done } = await reader.read();
             if (done) break;
@@ -886,8 +910,30 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
           if (buf.trim()) {
             await emitLine(buf.trim());
           }
+          const abnormalStopReasons = new Set([
+            'SAFETY',
+            'RECITATION',
+            'BLOCKLIST',
+            'PROHIBITED_CONTENT',
+            'SPII',
+            'MALFORMED_FUNCTION_CALL',
+            'OTHER',
+          ]);
           if (finishReason === 'MAX_TOKENS') {
             await writer.write(encoder.encode(`data: ${JSON.stringify({ meta: { phase: 'truncated', finishReason, truncated: true, model: effectiveModel } })}\n\n`));
+          } else if (finishReason && abnormalStopReasons.has(finishReason.toUpperCase())) {
+            await writer.write(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  meta: {
+                    phase: 'blocked',
+                    finishReason,
+                    model: effectiveModel,
+                    limitNotice: `模型触发限制中止输出 (${finishReason})`,
+                  },
+                })}\n\n`
+              )
+            );
           } else {
             await writer.write(encoder.encode(`data: ${JSON.stringify({ meta: { phase: 'done', finishReason: finishReason || 'STOP', model: effectiveModel } })}\n\n`));
           }
@@ -938,6 +984,10 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
     if (upstream.status === 400) {
       upstream = await callCompat(4096);
       if (upstream.status === 400) upstream = await callCompat(undefined);
+    }
+    if (!upstream.ok || !upstream.body) {
+      const errTxt = await upstream.text().catch(() => '');
+      return jsonRes({ error: errTxt.slice(0, 320) || `上游返回 HTTP ${upstream.status}` }, upstream.status);
     }
     return new Response(upstream.body, {
       status: upstream.status,
@@ -1200,13 +1250,19 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
     }
 
     if (env.AI && !body.apiKey) {
-      const out = await env.AI.run(model, input);
-      if (out && typeof out === 'object' && 'image' in (out as Record<string, unknown>)) {
-        const b64 = (out as { image: string }).image;
-        const bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-        return new Response(bin, { headers: imageHeaders('image/png') });
+      try {
+        const out = await env.AI.run(model, input);
+        if (out && typeof out === 'object' && 'image' in (out as Record<string, unknown>)) {
+          const b64 = (out as { image: string }).image;
+          const bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+          return new Response(bin, { headers: imageHeaders('image/png') });
+        }
+        return new Response(out as BodyInit, { headers: imageHeaders('image/png') });
+      } catch (aiErr: any) {
+        const msg = aiErr?.message || 'Cloudflare Workers AI 绘图受限或调用失败';
+        const status = /limit|quota|429|neurons/i.test(msg) ? 429 : 500;
+        return jsonRes({ error: msg }, status);
       }
-      return new Response(out as BodyInit, { headers: imageHeaders('image/png') });
     }
     const acc = body.accountId || env.CF_ACCOUNT_ID || '';
     const tok = body.apiKey || env.CF_API_TOKEN || '';
@@ -1414,7 +1470,14 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
   }
 
   if (pathname === '/api/bucket/upload' && method === 'POST') {
-    const body = (await request.json()) as { name: string; mimeType?: string; contentData: string; type?: 'image' | 'file' };
+    const body = (await request.json()) as {
+      name: string;
+      mimeType?: string;
+      contentData: string;
+      type?: 'image' | 'file';
+      prompt?: string;
+      modelId?: string;
+    };
     const safeName = (body.name || 'file').replace(/[^\w.\-\u4e00-\u9fff]/g, '_');
     const key = `bcai-assets/${Date.now()}-${safeName}`;
     const b64Match = body.contentData.match(/^data:([^;]+);base64,(.+)$/);
@@ -1428,7 +1491,60 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
       if (!s3) return jsonRes({ error: '未绑定对象存储桶' }, 400);
       await s3PutObject(s3, key, bytes, body.mimeType || 'application/octet-stream');
     }
-    return jsonRes({ ok: true, key, storageLocation: 'bucket' });
+
+    const now = new Date().toISOString();
+    const recordId = `bkt_${Date.now()}`;
+    const previewContent =
+      (body.type === 'image' || !body.type) && body.contentData.length < 300000
+        ? body.contentData
+        : `[存储桶对象] ${key}`;
+    const record = {
+      id: recordId,
+      type: (body.type || 'file') as 'image' | 'file',
+      name: body.name || safeName,
+      mime_type: body.mimeType || 'application/octet-stream',
+      size_bytes: bytes.byteLength,
+      prompt: body.prompt || '',
+      model_id: body.modelId || '',
+      content_data: previewContent,
+      storage_location: 'bucket' as const,
+      bucket_key: key,
+      created_at: now,
+      updated_at: now,
+    };
+    if (env.DB) {
+      try {
+        await ensureD1Schema(env);
+        await env.DB.prepare(
+          `INSERT OR REPLACE INTO media_assets
+           (id, type, name, mime_type, size_bytes, prompt, model_id, content_data, repo_path, storage_location, bucket_key, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 'bucket', ?, ?, ?)`
+        )
+          .bind(
+            record.id,
+            record.type,
+            record.name,
+            record.mime_type,
+            record.size_bytes,
+            record.prompt,
+            record.model_id,
+            record.content_data,
+            record.bucket_key,
+            now,
+            now
+          )
+          .run();
+      } catch {
+        // ignore index failure
+      }
+    } else if (extDb) {
+      try {
+        await upsertExternalDbAsset(extDb, record);
+      } catch {
+        // ignore index failure
+      }
+    }
+    return jsonRes({ ok: true, key, storageLocation: 'bucket', item: record });
   }
 
   if (pathname === '/api/bucket/download' && method === 'GET') {
@@ -1454,11 +1570,25 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
     if (!key) return jsonRes({ error: '缺少 key' }, 400);
     if (env.BUCKET) {
       await env.BUCKET.delete(key);
-      return jsonRes({ ok: true });
+    } else {
+      const s3 = getS3ConfigFromEnv(env);
+      if (!s3) return jsonRes({ error: '未绑定对象存储桶' }, 400);
+      await s3DeleteObject(s3, key);
     }
-    const s3 = getS3ConfigFromEnv(env);
-    if (!s3) return jsonRes({ error: '未绑定对象存储桶' }, 400);
-    await s3DeleteObject(s3, key);
+    if (env.DB) {
+      try {
+        await ensureD1Schema(env);
+        await env.DB.prepare('DELETE FROM media_assets WHERE bucket_key = ?').bind(key).run();
+      } catch {
+        // ignore
+      }
+    } else if (extDb) {
+      try {
+        await deleteExternalDbAssetByBucketKey(extDb, key);
+      } catch {
+        // ignore
+      }
+    }
     return jsonRes({ ok: true });
   }
 

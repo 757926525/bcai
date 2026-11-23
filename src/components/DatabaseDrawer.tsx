@@ -264,9 +264,11 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
         if (!res.ok) {
           const d = (await res.json().catch(() => ({}))) as { error?: string };
           setBucketErr(d.error || '上传存储桶失败');
+        } else {
+          setBucketMsg(`已上传到存储桶：${file.name}`);
         }
       } else {
-        await fetch('/api/db/items', {
+        const res = await fetch('/api/db/items', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
@@ -278,6 +280,12 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
             contentData,
           }),
         });
+        if (!res.ok) {
+          const d = (await res.json().catch(() => ({}))) as { error?: string };
+          setBindingErr(d.error || '保存数据库失败');
+        } else {
+          setBindingMsg(`已上传到数据库：${file.name}`);
+        }
       }
       refresh();
     };
@@ -287,15 +295,35 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
   };
 
   const handleDelete = async (item: SavedAsset) => {
+    setBindingErr('');
+    setBucketErr('');
     if (item.storage_location === 'bucket' && item.bucket_key) {
-      await fetch(`/api/bucket/items?key=${encodeURIComponent(item.bucket_key)}`, { method: 'DELETE' });
+      const bktRes = await fetch(`/api/bucket/items?key=${encodeURIComponent(item.bucket_key)}`, { method: 'DELETE' });
+      if (!bktRes.ok) {
+        const d = (await bktRes.json().catch(() => ({}))) as { error?: string };
+        setBucketErr(d.error || '删除存储桶对象失败');
+        return;
+      }
     }
-    await fetch(`/api/db/items/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
+    const dbRes = await fetch(`/api/db/items/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
+    if (!dbRes.ok) {
+      const d = (await dbRes.json().catch(() => ({}))) as { error?: string };
+      setBindingErr(d.error || '删除记录失败');
+      return;
+    }
+    setBindingMsg(`已删除：${item.name}`);
     refresh();
   };
 
   const handleDeleteBucketObject = async (key: string) => {
-    await fetch(`/api/bucket/items?key=${encodeURIComponent(key)}`, { method: 'DELETE' });
+    setBucketErr('');
+    const res = await fetch(`/api/bucket/items?key=${encodeURIComponent(key)}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const d = (await res.json().catch(() => ({}))) as { error?: string };
+      setBucketErr(d.error || '删除存储桶对象失败');
+      return;
+    }
+    setBucketMsg(`已删除存储桶对象：${key}`);
     refresh();
   };
 
@@ -305,14 +333,19 @@ export const DatabaseDrawer: React.FC<DatabaseDrawerProps> = ({
       return;
     }
     const a = document.createElement('a');
+    let objUrl: string | null = null;
     if (item.type === 'image' && item.content_data.startsWith('data:')) {
       a.href = item.content_data;
     } else {
       const blob = new Blob([item.content_data], { type: item.mime_type || 'text/plain;charset=utf-8' });
-      a.href = URL.createObjectURL(blob);
+      objUrl = URL.createObjectURL(blob);
+      a.href = objUrl;
     }
     a.download = item.name;
     a.click();
+    if (objUrl) {
+      setTimeout(() => URL.revokeObjectURL(objUrl!), 1500);
+    }
   };
 
   const handlePullCloudConvs = async () => {
