@@ -184,9 +184,196 @@ export function hasUnclosedCodeFence(markdown: string): boolean {
   return blocks.some((b) => !b.closed);
 }
 
+export function hasUnclosedThinkBlock(markdown: string): boolean {
+  if (!markdown) return false;
+  const openCount = (markdown.match(/<think>/g) || []).length;
+  const closeCount = (markdown.match(/<\/think>/g) || []).length;
+  return openCount > closeCount;
+}
+
 export function suggestCodeFilename(lang: string, index: number, explicitFilename?: string): string {
   if (explicitFilename) return explicitFilename;
   const ext = LANG_EXT_MAP[(lang || '').toLowerCase()] || 'txt';
   if (ext === 'Dockerfile') return index === 0 ? 'Dockerfile' : `Dockerfile.${index + 1}`;
   return `code-${index + 1}.${ext}`;
+}
+
+export interface ProjectCompletenessReport {
+  incomplete: boolean;
+  reason: 'truncated' | 'interrupted' | 'unclosed_fence' | 'unclosed_think' | 'abrupt_end' | 'missing_planned_files' | 'complete';
+  detail: string;
+  writtenFiles: string[];
+  missingFiles: string[];
+}
+
+export function analyzeProjectCompleteness(
+  markdown: string,
+  mode: 'chat' | 'code' | 'repo',
+  streamResult?: { truncated?: boolean; interrupted?: boolean; finishReason?: string }
+): ProjectCompletenessReport {
+  const trimmed = (markdown || '').trim();
+  const blocks = extractCodeBlocks(trimmed);
+  const writtenFiles = blocks.map((b, i) => suggestCodeFilename(b.lang, i, b.filename));
+
+  if (!trimmed) {
+    return {
+      incomplete: Boolean(streamResult?.interrupted),
+      reason: streamResult?.interrupted ? 'interrupted' : 'complete',
+      detail: '尚未生成输出内容',
+      writtenFiles,
+      missingFiles: [],
+    };
+  }
+
+  if (streamResult?.truncated) {
+    return {
+      incomplete: true,
+      reason: 'truncated',
+      detail: '触发单轮输出长度上限，需继续生成剩余模块',
+      writtenFiles,
+      missingFiles: [],
+    };
+  }
+
+  if (streamResult?.interrupted) {
+    return {
+      incomplete: true,
+      reason: 'interrupted',
+      detail: '流式传输意外中断，需从断点继续输出',
+      writtenFiles,
+      missingFiles: [],
+    };
+  }
+
+  if (hasUnclosedCodeFence(trimmed)) {
+    return {
+      incomplete: true,
+      reason: 'unclosed_fence',
+      detail: '存在尚未闭合的代码块，需继续补全收尾',
+      writtenFiles,
+      missingFiles: [],
+    };
+  }
+
+  if (hasUnclosedThinkBlock(trimmed)) {
+    return {
+      incomplete: true,
+      reason: 'unclosed_think',
+      detail: '思考标签尚未闭合，需继续输出正文代码',
+      writtenFiles,
+      missingFiles: [],
+    };
+  }
+
+  // Detect abrupt mid-sentence cut-off in prose after closing a fence (or in code mode)
+  const withoutThink = trimmed.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+  const lastLine = (withoutThink.split('\n').pop() || '').trim();
+  const lastIsCodeClose = lastLine === '```';
+
+  if (
+    lastLine &&
+    !lastIsCodeClose &&
+    (/[:,;=\(\{\[\-\/\\]$/.test(lastLine) ||
+      /^#{1,4}\s+\S+$/.test(lastLine) ||
+      /(?:接下来|继续输出|下面实现|待续|unfinished|to be continued)[：:]?$/i.test(lastLine))
+  ) {
+    return {
+      incomplete: true,
+      reason: 'abrupt_end',
+      detail: '文本末尾呈现未完待续状态，需自动接续完成',
+      writtenFiles,
+      missingFiles: [],
+    };
+  }
+
+  // Detect if the model explicitly listed multiple project files in its intro/tree before code blocks,
+  // wrote some of them, and ended right on a code fence or mid-project without finishing the remaining planned files.
+  if ((mode === 'code' || mode === 'repo') && blocks.length > 0) {
+    const firstFencePos = withoutThink.indexOf('```');
+    const introText = firstFencePos > 0 ? withoutThink.slice(0, firstFencePos) : '';
+    const lastFenceEnd = withoutThink.lastIndexOf('```');
+    const trailingProse = lastFenceEnd >= 0 ? withoutThink.slice(lastFenceEnd + 3).trim() : '';
+
+    // Find explicit project file names mentioned in the intro structure (e.g. src/App.tsx, package.json)
+    const plannedSet = new Set<string>();
+    const fileMentionRe = /(?:^|[\s`"'(\[├──└│])+((?:[a-zA-Z0-9_-]+\/)*[a-zA-Z0-9._-]+\.(?:tsx?|jsx?|mjs|cjs|html|css|scss|json|py|go|rs|vue|svelte|sql|yml|yaml))/gm;
+    let fm: RegExpExecArray | null;
+    while ((fm = fileMentionRe.exec(introText)) !== null) {
+      const candidate = fm[1].replace(/^\/+/, '');
+      if (candidate && !candidate.includes('..') && candidate.length <= 80) {
+        plannedSet.add(candidate);
+      }
+    }
+
+    const writtenNormalized = new Set(
+      writtenFiles.map((f) => f.toLowerCase())
+    );
+    const writtenBasenames = new Set(
+      writtenFiles.map((f) => (f.split('/').pop() || f).toLowerCase())
+    );
+    const missingFiles = Array.from(plannedSet).filter((pf) => {
+      const low = pf.toLowerCase();
+      const base = (pf.split('/').pop() || pf).toLowerCase();
+      return !writtenNormalized.has(low) && !writtenBasenames.has(base);
+    });
+
+    // Only treat as incomplete if there is no concluding prose (stopped right at code block end) and planned files remain
+    if (missingFiles.length > 0 && trailingProse.length < 40) {
+      return {
+        incomplete: true,
+        reason: 'missing_planned_files',
+        detail: `已规划项目文件尚余 ${missingFiles.length} 个未写出 (${missingFiles.slice(0, 3).join(', ')})`,
+        writtenFiles,
+        missingFiles,
+      };
+    }
+  }
+
+  return {
+    incomplete: false,
+    reason: 'complete',
+    detail: blocks.length > 0 ? `项目代码已完整写出（共 ${blocks.length} 个模块）` : '回复已完整生成',
+    writtenFiles,
+    missingFiles: [],
+  };
+}
+
+/**
+ * Strips leading duplicated code fences and overlapping suffix/prefix lines when seamlessly merging
+ * an auto-continuation chunk onto existing generated content.
+ */
+export function trimContinuationPrefix(
+  existing: string,
+  incomingPrefix: string,
+  wasInsideUnclosedFence: boolean,
+  wasInsideUnclosedThink: boolean
+): string {
+  let clean = incomingPrefix;
+
+  if (wasInsideUnclosedThink) {
+    clean = clean.replace(/^\s*<think>\s*\n?/, '');
+  }
+
+  if (wasInsideUnclosedFence) {
+    // Strip redundant opening fence like ```tsx or ```ts src/App.tsx
+    clean = clean.replace(/^\s*```[^\n]*\n?/, '');
+  }
+
+  // Trim exact character overlap between tail of existing and head of clean (min 18 chars)
+  const existingTail = existing.slice(-400);
+  const maxCheck = Math.min(existingTail.length, clean.length);
+  for (let len = maxCheck; len >= 18; len--) {
+    if (existingTail.endsWith(clean.slice(0, len))) {
+      clean = clean.slice(len);
+      break;
+    }
+  }
+
+  if (existing && clean && !existing.endsWith('\n') && !clean.startsWith('\n')) {
+    if (!wasInsideUnclosedFence || clean.startsWith('```')) {
+      clean = '\n' + clean;
+    }
+  }
+
+  return clean;
 }

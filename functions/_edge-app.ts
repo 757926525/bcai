@@ -183,25 +183,84 @@ async function ensureD1Schema(env: CFEnv): Promise<void> {
   ).run();
 }
 
-async function getD1Setting(env: CFEnv, key: string): Promise<string> {
-  if (!env.DB) return '';
-  try {
-    await ensureD1Schema(env);
-    const row = await env.DB.prepare('SELECT value FROM admin_settings WHERE key = ?')
-      .bind(key)
-      .first<{ value: string }>();
-    return row?.value || '';
-  } catch {
-    return '';
+const EDGE_SETTINGS_OBJECT_KEY = '_system/admin-settings.json';
+
+async function readEdgeSettingsMap(env: CFEnv): Promise<Record<string, string>> {
+  if (env.BUCKET) {
+    try {
+      const obj = await env.BUCKET.get(EDGE_SETTINGS_OBJECT_KEY);
+      if (obj) return JSON.parse(await obj.text()) as Record<string, string>;
+    } catch {
+      // ignore
+    }
   }
+  const s3 = getS3ConfigFromEnv(env);
+  if (s3) {
+    try {
+      const got = await s3GetObject(s3, EDGE_SETTINGS_OBJECT_KEY);
+      if (got) return JSON.parse(new TextDecoder().decode(got.bytes)) as Record<string, string>;
+    } catch {
+      // ignore
+    }
+  }
+  return {};
 }
 
-async function setD1Setting(env: CFEnv, key: string, value: string): Promise<void> {
-  if (!env.DB) return;
-  await ensureD1Schema(env);
-  await env.DB.prepare('INSERT OR REPLACE INTO admin_settings (key, value, updated_at) VALUES (?, ?, ?)')
-    .bind(key, value, new Date().toISOString())
-    .run();
+async function writeEdgeSettingsMap(env: CFEnv, key: string, value: string | null): Promise<boolean> {
+  if (env.BUCKET) {
+    const map = await readEdgeSettingsMap(env);
+    if (value === null) delete map[key];
+    else map[key] = value;
+    await env.BUCKET.put(EDGE_SETTINGS_OBJECT_KEY, JSON.stringify(map), {
+      httpMetadata: { contentType: 'application/json; charset=utf-8' },
+    });
+    return true;
+  }
+  const s3 = getS3ConfigFromEnv(env);
+  if (s3) {
+    const map = await readEdgeSettingsMap(env);
+    if (value === null) delete map[key];
+    else map[key] = value;
+    await s3PutObject(s3, EDGE_SETTINGS_OBJECT_KEY, new TextEncoder().encode(JSON.stringify(map)), 'application/json');
+    return true;
+  }
+  return false;
+}
+
+async function getD1Setting(env: CFEnv, key: string): Promise<string> {
+  if (env.DB) {
+    try {
+      await ensureD1Schema(env);
+      const row = await env.DB.prepare('SELECT value FROM admin_settings WHERE key = ?')
+        .bind(key)
+        .first<{ value: string }>();
+      if (row?.value) return row.value;
+    } catch {
+      // fall through
+    }
+  }
+  const map = await readEdgeSettingsMap(env);
+  return map[key] || '';
+}
+
+async function setD1Setting(env: CFEnv, key: string, value: string): Promise<boolean> {
+  if (env.DB) {
+    await ensureD1Schema(env);
+    await env.DB.prepare('INSERT OR REPLACE INTO admin_settings (key, value, updated_at) VALUES (?, ?, ?)')
+      .bind(key, value, new Date().toISOString())
+      .run();
+    return true;
+  }
+  return writeEdgeSettingsMap(env, key, value);
+}
+
+async function deleteD1Setting(env: CFEnv, key: string): Promise<void> {
+  if (env.DB) {
+    await ensureD1Schema(env);
+    await env.DB.prepare('DELETE FROM admin_settings WHERE key = ?').bind(key).run();
+    return;
+  }
+  await writeEdgeSettingsMap(env, key, null);
 }
 
 async function getEdgeAdminPasswordHash(env: CFEnv): Promise<string> {
@@ -210,7 +269,9 @@ async function getEdgeAdminPasswordHash(env: CFEnv): Promise<string> {
 
 async function getEdgeLoginGate(env: CFEnv): Promise<boolean> {
   const v = await getD1Setting(env, 'login_gate');
-  return v === '1' || v === 'true';
+  if (v === '1' || v === 'true') return true;
+  if (v === '0' || v === 'false') return false;
+  return (env.REQUIRE_LOGIN_GATE || '').toLowerCase() === 'true';
 }
 
 function getEdgeSecretSeed(env: CFEnv): string {
@@ -403,14 +464,15 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
       if (!okEnv && !okCustom) {
         return jsonRes({ error: '管理员密码错误' }, 401);
       }
-    } else if (pw.trim() && env.DB) {
+    } else if (pw.trim()) {
       const h = await sha256Hex(pw.trim());
       await setD1Setting(env, 'admin_pw_hash', h);
     }
 
+    const latestHash = await getEdgeAdminPasswordHash(env);
     const token = await sha256Hex(`bcai-admin:${getEdgeSecretSeed(env)}`);
     return new Response(
-      JSON.stringify({ ok: true, isAdmin: true, adminToken: token, hasAdminPassword: Boolean(hasAny || pw.trim()) }),
+      JSON.stringify({ ok: true, isAdmin: true, adminToken: token, hasAdminPassword: Boolean(env.ACCESS_PASSWORD || latestHash) }),
       {
         status: 200,
         headers: {
@@ -433,15 +495,33 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
 
   if (pathname === '/api/auth/login-gate' && method === 'POST') {
     if (!(await isEdgeAdmin(request, env))) return jsonRes({ error: '仅限管理员操作' }, 401);
-    const body = (await request.json().catch(() => ({}))) as { enabled?: boolean };
-    if (!env.DB) {
-      return jsonRes({ error: 'Edge 模式下启用持久化登录门禁需绑定 Cloudflare D1 (env.DB)' }, 400);
-    }
+    const body = (await request.json().catch(() => ({}))) as { enabled?: boolean; initialPassword?: string };
     const enabled = Boolean(body.enabled);
-    await setD1Setting(env, 'login_gate', enabled ? '1' : '0');
+    const savedHash = await getEdgeAdminPasswordHash(env);
+    const hasPw = Boolean(env.ACCESS_PASSWORD || savedHash);
+
+    if (enabled && !hasPw) {
+      const initPw = (body.initialPassword || '').trim();
+      if (initPw.length >= 4) {
+        const h = await sha256Hex(initPw);
+        const saved = await setD1Setting(env, 'admin_pw_hash', h);
+        if (!saved) {
+          return jsonRes({ error: 'Edge 模式下保存管理员密码需要绑定 D1 (DB) 或 R2/S3 存储桶，或在环境变量设置 ACCESS_PASSWORD。' }, 400);
+        }
+      } else {
+        return jsonRes({ error: '开启全站登录拦截前，请先设定管理员密码（至少 4 位字符），避免锁站后无法验证身份。' }, 400);
+      }
+    }
+
+    const okSaved = await setD1Setting(env, 'login_gate', enabled ? '1' : '0');
+    if (!okSaved) {
+      return jsonRes({ error: 'Edge 模式下持久化登录门禁开关需要绑定 Cloudflare D1 (DB) 或 R2 (BUCKET)/S3 存储桶，或设置环境变量 REQUIRE_LOGIN_GATE=true。' }, 400);
+    }
+    const updatedHash = await getEdgeAdminPasswordHash(env);
     return jsonRes({
       ok: true,
       requireLoginGate: enabled,
+      hasAdminPassword: Boolean(env.ACCESS_PASSWORD || updatedHash),
       message: enabled
         ? '已开启全站访问限制：未登录管理员将看到登录拦截界面'
         : '已关闭全站访问限制：普通访客可直接进入工作台',
@@ -451,17 +531,18 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
   if (pathname === '/api/auth/admin-password' && method === 'POST') {
     if (!(await isEdgeAdmin(request, env))) return jsonRes({ error: '仅限管理员操作' }, 401);
     const body = (await request.json().catch(() => ({}))) as { newPassword?: string; clearCustomPassword?: boolean };
-    if (!env.DB) return jsonRes({ error: 'Edge 模式下修改动态密码需绑定 D1 (DB)，或直接在环境变量修改 ACCESS_PASSWORD' }, 400);
-    await ensureD1Schema(env);
     if (body.clearCustomPassword) {
-      await env.DB.prepare("DELETE FROM admin_settings WHERE key = 'admin_pw_hash'").bind().run();
-      return jsonRes({ ok: true, message: '已清除自定义密码' });
+      await deleteD1Setting(env, 'admin_pw_hash');
+      return jsonRes({ ok: true, message: '已清除自定义密码', hasAdminPassword: Boolean(env.ACCESS_PASSWORD) });
     }
     const trimmed = (body.newPassword || '').trim();
     if (trimmed.length < 4) return jsonRes({ error: '密码至少 4 位字符' }, 400);
     const h = await sha256Hex(trimmed);
-    await setD1Setting(env, 'admin_pw_hash', h);
-    return jsonRes({ ok: true, message: '管理员密码已保存至 D1' });
+    const saved = await setD1Setting(env, 'admin_pw_hash', h);
+    if (!saved) {
+      return jsonRes({ error: 'Edge 模式下修改动态密码需绑定 D1 (DB) 或 R2/S3，或直接在环境变量修改 ACCESS_PASSWORD' }, 400);
+    }
+    return jsonRes({ ok: true, message: '管理员密码已保存', hasAdminPassword: true });
   }
 
   // OAuth callback (reachable directly from provider popup)
@@ -563,9 +644,12 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
     return new Response(html, { headers });
   }
 
-  // Enforce global login gate on AI endpoints when toggled ON
+  // Enforce global login gate on AI & deploy routes when toggled ON
   if (
-    (pathname === '/api/chat' || pathname === '/api/image' || pathname === '/api/providers/probe') &&
+    (pathname === '/api/chat' ||
+      pathname === '/api/image' ||
+      pathname === '/api/providers/probe' ||
+      pathname.startsWith('/api/deploy/')) &&
     (await getEdgeLoginGate(env)) &&
     !(await isEdgeAdmin(request, env))
   ) {
@@ -655,21 +739,39 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
     if (providerType === 'workers-ai' || model.startsWith('@cf/')) {
       const formatted = formatEdgeMessages(messages);
       if (env.AI && source !== 'custom') {
-        const stream = (await env.AI.run(model, { messages: formatted, temperature, stream: true })) as ReadableStream;
-        return new Response(stream, {
-          headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache' },
-        });
+        try {
+          const stream = (await env.AI.run(model, { messages: formatted, temperature, max_tokens: 8192, stream: true })) as ReadableStream;
+          return new Response(stream, {
+            headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache' },
+          });
+        } catch {
+          const stream = (await env.AI.run(model, { messages: formatted, temperature, stream: true })) as ReadableStream;
+          return new Response(stream, {
+            headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache' },
+          });
+        }
       }
       const acc = accountId || env.CF_ACCOUNT_ID || '';
       const tok = apiKey || env.CF_API_TOKEN || '';
       if (!acc || !tok) {
         return jsonRes({ error: '未绑定 Cloudflare Workers AI (env.AI) 或 CF_ACCOUNT_ID/CF_API_TOKEN。' }, 400);
       }
-      const upstream = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(acc)}/ai/run/${model}`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ messages: formatted, temperature, stream: true }),
-      });
+      const callCfRest = (maxTokens?: number) =>
+        fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(acc)}/ai/run/${model}`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
+          body: JSON.stringify({
+            messages: formatted,
+            temperature,
+            stream: true,
+            ...(maxTokens ? { max_tokens: maxTokens } : {}),
+          }),
+        });
+      let upstream = await callCfRest(8192);
+      if (upstream.status === 400) {
+        upstream = await callCfRest(4096);
+        if (upstream.status === 400) upstream = await callCfRest(undefined);
+      }
       return new Response(upstream.body, {
         status: upstream.status,
         headers: { 'content-type': upstream.headers.get('content-type') || 'text/event-stream; charset=utf-8' },
@@ -709,7 +811,9 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
 
       const callGeminiEdge = async (targetModel: string) => {
         const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(targetModel)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`;
-        const generationConfig: Record<string, unknown> = {};
+        const generationConfig: Record<string, unknown> = {
+          maxOutputTokens: 32768,
+        };
         if (targetModel === 'gemini-4-hydrogen') {
           generationConfig.thinkingConfig = { thinkingLevel: 'MEDIUM' };
         }
@@ -719,7 +823,7 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
           body: JSON.stringify({
             contents,
             ...(sys ? { systemInstruction: { parts: [{ text: sys }] } } : {}),
-            ...(Object.keys(generationConfig).length ? { generationConfig } : {}),
+            generationConfig,
           }),
         });
       };
@@ -749,7 +853,13 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
             const parsed = JSON.parse(raw);
             const candidate = parsed?.candidates?.[0];
             if (candidate?.finishReason) finishReason = String(candidate.finishReason);
-            const text = candidate?.content?.parts?.[0]?.text || '';
+            const parts = candidate?.content?.parts;
+            const text = Array.isArray(parts)
+              ? parts
+                  .filter((p: any) => !p?.thought)
+                  .map((p: any) => (typeof p?.text === 'string' ? p.text : ''))
+                  .join('')
+              : '';
             if (text) {
               if (!sentWriting) {
                 sentWriting = true;
@@ -812,72 +922,281 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
     const formatted = formatEdgeMessages(messages);
     const cleanBase = targetUrl.replace(/\/+$/, '');
     const chatUrl = cleanBase.endsWith('/chat/completions') ? cleanBase : `${cleanBase}/chat/completions`;
-    const upstream = await fetch(chatUrl, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ model, messages: formatted, temperature, stream: true }),
-    });
+    const callCompat = (maxTokens?: number) =>
+      fetch(chatUrl, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages: formatted,
+          temperature,
+          stream: true,
+          ...(maxTokens ? { max_tokens: maxTokens } : {}),
+        }),
+      });
+    let upstream = await callCompat(8192);
+    if (upstream.status === 400) {
+      upstream = await callCompat(4096);
+      if (upstream.status === 400) upstream = await callCompat(undefined);
+    }
     return new Response(upstream.body, {
       status: upstream.status,
       headers: { 'content-type': upstream.headers.get('content-type') || 'text/event-stream; charset=utf-8' },
     });
   }
 
-  // Image Generation with Negative Prompt, CFG Guidance & Seed
+  // Multi-Engine Image Generation Endpoint (Pollinations Zero-Key / Workers AI / SiliconFlow Kolors / HuggingFace / OpenAI-Compatible)
   if (pathname === '/api/image' && method === 'POST') {
     const body = (await request.json()) as {
       prompt: string;
       negativePrompt?: string;
       model?: string;
+      providerType?: 'pollinations' | 'workers-ai' | 'siliconflow' | 'huggingface' | 'openai-image';
+      baseUrl?: string;
       steps?: number;
       guidance?: number;
       seed?: string | number;
       width?: number;
       height?: number;
+      enhanceMode?: 'none' | 'translate' | 'enhance';
+      stylePreset?: string;
       translate?: boolean;
       accountId?: string;
       apiKey?: string;
     };
-    const model = body.model || '@cf/black-forest-labs/flux-1-schnell';
-    let finalPrompt = body.prompt;
+    if (!body.prompt || !body.prompt.trim()) {
+      return jsonRes({ error: '请输入画面描述词' }, 400);
+    }
+
+    const STYLE_SUFFIXES: Record<string, { pos: string; neg: string }> = {
+      photorealistic: {
+        pos: 'photorealistic, 8k uhd, natural lighting, cinematic depth of field, sharp focus, shot on 35mm lens',
+        neg: 'cartoon, anime, 3d render, painting, artificial skin, blurry, overexposed',
+      },
+      anime: {
+        pos: 'high quality anime illustration, crisp cel shading, vibrant lighting, expressive details, clean lineart',
+        neg: 'photorealistic, 3d, deformed hands, extra fingers, muddy colors, lowres',
+      },
+      '3d-render': {
+        pos: 'octane render, 3d studio lighting, smooth subsurface scattering, volumetric light, clean geometric detail',
+        neg: 'flat 2d sketch, noise, grainy, blurry, distorted geometry',
+      },
+      'chinese-ink': {
+        pos: 'traditional Chinese ink wash and mineral color painting, poetic atmosphere, delicate brushwork, rice paper texture',
+        neg: 'modern neon, 3d plastic, harsh digital noise, cluttered',
+      },
+      cyberpunk: {
+        pos: 'cyberpunk sci-fi atmosphere, glowing neon reflections on wet surfaces, dramatic rim light, high contrast',
+        neg: 'daylight flat lighting, washed out, low contrast, blurry',
+      },
+      'ui-design': {
+        pos: 'clean modern studio product photography, minimal composition, soft diffused studio light, high-end industrial design',
+        neg: 'cluttered background, messy text, watermark, distorted typography',
+      },
+      'flat-illustration': {
+        pos: 'modern editorial vector illustration, balanced geometric shapes, harmonious color palette, crisp edges',
+        neg: 'photorealistic noise, 3d shading, muddy gradients, messy lines',
+      },
+    };
+
+    const model = body.model || 'pollinations:flux';
+    const providerType =
+      body.providerType ||
+      (model.startsWith('pollinations:') ? 'pollinations' : model.startsWith('@cf/') ? 'workers-ai' : 'pollinations');
+    const enhanceMode: 'none' | 'translate' | 'enhance' =
+      body.enhanceMode || (body.translate ? 'translate' : 'none');
+
+    const w = Math.min(Math.max(Number(body.width) || 1024, 256), 1536);
+    const h = Math.min(Math.max(Number(body.height) || 1024, 256), 1536);
+    const seedNum =
+      body.seed !== undefined && String(body.seed).trim() !== '' && !Number.isNaN(Number(body.seed))
+        ? Number(body.seed)
+        : undefined;
+
+    let finalPrompt = body.prompt.trim();
     let finalNegative = (body.negativePrompt || '').trim();
-    if (body.translate && env.AI) {
-      if (/[\u4e00-\u9fff]/.test(finalPrompt)) {
-        try {
+
+    if (enhanceMode !== 'none') {
+      const geminiKey = env.GEMINI_API_KEY && env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY' ? env.GEMINI_API_KEY : '';
+      const askRewrite = async (instruction: string): Promise<string> => {
+        if (geminiKey) {
+          const r = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${encodeURIComponent(geminiKey)}`,
+            {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: instruction }] }] }),
+            }
+          );
+          if (r.ok) {
+            const j = (await r.json()) as any;
+            const t = j?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (typeof t === 'string' && t.trim()) return t.trim().replace(/^["']|["']$/g, '');
+          }
+        } else if (env.AI) {
           const tr = (await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
-            messages: [
-              { role: 'system', content: 'Translate this image prompt into concise vivid English. Output ONLY the prompt.' },
-              { role: 'user', content: finalPrompt },
-            ],
+            messages: [{ role: 'user', content: instruction }],
           })) as { response?: string };
-          if (tr?.response) finalPrompt = tr.response.trim();
-        } catch {
-          // ignore
+          if (tr?.response) return tr.response.trim().replace(/^["']|["']$/g, '');
         }
-      }
-      if (finalNegative && /[\u4e00-\u9fff]/.test(finalNegative)) {
-        try {
-          const trNeg = (await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
-            messages: [
-              { role: 'system', content: 'Translate these negative prompt tags into concise comma-separated English tags. Output ONLY the tags.' },
-              { role: 'user', content: finalNegative },
-            ],
-          })) as { response?: string };
-          if (trNeg?.response) finalNegative = trNeg.response.trim();
-        } catch {
-          // ignore
+        return '';
+      };
+
+      try {
+        if (enhanceMode === 'enhance') {
+          const out = await askRewrite(
+            `You are an expert visual prompt engineer for FLUX/SDXL/Kolors. Translate or refine this prompt into precise English, strictly preserving EVERY subject, count, spatial relation, color, action, and quoted text, while adding fitting lighting, composition, and texture (<= 95 words, output ONLY the final prompt):\n${finalPrompt}`
+          );
+          if (out) finalPrompt = out;
+        } else if (/[\u4e00-\u9fff]/.test(finalPrompt)) {
+          const out = await askRewrite(
+            `Translate this image prompt accurately into concise, vivid English preserving all subjects, counts, and colors. Output ONLY the prompt:\n${finalPrompt}`
+          );
+          if (out) finalPrompt = out;
         }
+        if (finalNegative && /[\u4e00-\u9fff]/.test(finalNegative)) {
+          const outNeg = await askRewrite(
+            `Translate these negative prompt tags into concise comma-separated English tags. Output ONLY the tags:\n${finalNegative}`
+          );
+          if (outNeg) finalNegative = outNeg;
+        }
+      } catch {
+        // fallback to raw prompt
       }
     }
+
+    const preset = body.stylePreset ? STYLE_SUFFIXES[body.stylePreset] : undefined;
+    if (preset) {
+      finalPrompt = `${finalPrompt}, ${preset.pos}`;
+      finalNegative = finalNegative ? `${finalNegative}, ${preset.neg}` : preset.neg;
+    }
+
+    const imageHeaders = (ctype = 'image/png'): Record<string, string> => ({
+      'content-type': ctype,
+      'x-final-prompt': encodeURIComponent(finalPrompt),
+      ...(finalNegative ? { 'x-final-negative': encodeURIComponent(finalNegative) } : {}),
+    });
+
+    if (providerType === 'pollinations') {
+      const pollModel = model.replace(/^pollinations:/, '') || 'flux';
+      const qs = new URLSearchParams({
+        model: pollModel,
+        width: String(w),
+        height: String(h),
+        nologo: 'true',
+        enhance: String(enhanceMode === 'enhance'),
+      });
+      if (seedNum !== undefined) qs.set('seed', String(seedNum));
+      if (finalNegative) qs.set('negative_prompt', finalNegative);
+      const pollUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(finalPrompt)}?${qs.toString()}`;
+      let upstream = await fetch(pollUrl);
+      if (upstream.status >= 500 || upstream.status === 429) {
+        await new Promise((r) => setTimeout(r, 900));
+        upstream = await fetch(pollUrl);
+      }
+      if (!upstream.ok) {
+        return jsonRes({ error: `Pollinations HTTP ${upstream.status}: ${(await upstream.text()).slice(0, 160)}` }, upstream.status);
+      }
+      return new Response(upstream.body, {
+        headers: imageHeaders(upstream.headers.get('content-type') || 'image/jpeg'),
+      });
+    }
+
+    if (providerType === 'siliconflow') {
+      const token = (body.apiKey || '').trim();
+      if (!token) return jsonRes({ error: '请在外接绘图配置中填写 SiliconFlow API Key' }, 400);
+      const target = (body.baseUrl || 'https://api.siliconflow.cn/v1/images/generations').trim();
+      assertSafeExternalUrl(target);
+      const upstream = await fetch(target, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: model || 'Kwai-Kolors/Kolors',
+          prompt: finalPrompt,
+          ...(finalNegative ? { negative_prompt: finalNegative } : {}),
+          image_size: `${w}x${h}`,
+          num_inference_steps: Math.min(Math.max(Number(body.steps) || 20, 1), 50),
+          guidance_scale: Number(body.guidance) || 7.5,
+          ...(seedNum !== undefined ? { seed: seedNum } : {}),
+        }),
+      });
+      if (!upstream.ok) return jsonRes({ error: await upstream.text() }, upstream.status);
+      const j = (await upstream.json()) as any;
+      const b64 = j?.data?.[0]?.b64_json;
+      if (b64) {
+        const bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        return new Response(bin, { headers: imageHeaders('image/png') });
+      }
+      const imgUrl = j?.images?.[0]?.url || j?.data?.[0]?.url;
+      if (!imgUrl) return jsonRes({ error: 'SiliconFlow 未返回图像 URL' }, 500);
+      assertSafeExternalUrl(imgUrl);
+      const imgRes = await fetch(imgUrl);
+      if (!imgRes.ok) return jsonRes({ error: `下载图像失败 HTTP ${imgRes.status}` }, 502);
+      return new Response(imgRes.body, { headers: imageHeaders(imgRes.headers.get('content-type') || 'image/png') });
+    }
+
+    if (providerType === 'huggingface') {
+      const token = (body.apiKey || '').trim();
+      if (!token) return jsonRes({ error: '请在外接绘图配置中填写 Hugging Face Access Token' }, 400);
+      const cleanBase = (body.baseUrl || 'https://router.huggingface.co/hf-inference/models').trim().replace(/\/+$/, '');
+      const cleanModel = model.replace(/^\/+/, '');
+      const target = cleanBase.endsWith(cleanModel) ? cleanBase : `${cleanBase}/${cleanModel}`;
+      assertSafeExternalUrl(target);
+      const upstream = await fetch(target, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          inputs: finalPrompt,
+          parameters: {
+            ...(finalNegative ? { negative_prompt: finalNegative } : {}),
+            width: w,
+            height: h,
+            num_inference_steps: Math.min(Math.max(Number(body.steps) || 25, 1), 50),
+            guidance_scale: Number(body.guidance) || 7.5,
+            ...(seedNum !== undefined ? { seed: seedNum } : {}),
+          },
+        }),
+      });
+      if (!upstream.ok) return jsonRes({ error: await upstream.text() }, upstream.status);
+      return new Response(upstream.body, { headers: imageHeaders(upstream.headers.get('content-type') || 'image/png') });
+    }
+
+    if (providerType === 'openai-image') {
+      const token = (body.apiKey || '').trim();
+      if (!token) return jsonRes({ error: '请在外接绘图配置中填写兼容接口 API Key' }, 400);
+      const cleanBase = (body.baseUrl || 'https://api.together.xyz/v1/images/generations').trim().replace(/\/+$/, '');
+      const target = cleanBase.endsWith('/images/generations') ? cleanBase : `${cleanBase}/images/generations`;
+      assertSafeExternalUrl(target);
+      const upstream = await fetch(target, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ model, prompt: finalPrompt, size: `${w}x${h}`, n: 1 }),
+      });
+      if (!upstream.ok) return jsonRes({ error: await upstream.text() }, upstream.status);
+      const j = (await upstream.json()) as any;
+      const b64 = j?.data?.[0]?.b64_json;
+      if (b64) {
+        const bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        return new Response(bin, { headers: imageHeaders('image/png') });
+      }
+      const imgUrl = j?.data?.[0]?.url;
+      if (!imgUrl) return jsonRes({ error: '外接绘图接口未返回图像 URL' }, 500);
+      assertSafeExternalUrl(imgUrl);
+      const imgRes = await fetch(imgUrl);
+      if (!imgRes.ok) return jsonRes({ error: `下载图像失败 HTTP ${imgRes.status}` }, 502);
+      return new Response(imgRes.body, { headers: imageHeaders(imgRes.headers.get('content-type') || 'image/png') });
+    }
+
+    // Workers AI Image Models
     const input: Record<string, unknown> = { prompt: finalPrompt, num_steps: body.steps || 4 };
-    if (!model.includes('flux')) {
-      input.width = body.width || 1024;
-      input.height = body.height || 1024;
+    if (!model.includes('flux-1-schnell')) {
+      input.width = w;
+      input.height = h;
       if (finalNegative) input.negative_prompt = finalNegative;
       if (typeof body.guidance === 'number' && !Number.isNaN(body.guidance)) input.guidance = body.guidance;
     }
-    if (body.seed !== undefined && String(body.seed).trim() !== '' && !Number.isNaN(Number(body.seed))) {
-      input.seed = Number(body.seed);
+    if (seedNum !== undefined) {
+      input.seed = seedNum;
     }
 
     if (env.AI && !body.apiKey) {
@@ -885,18 +1204,14 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
       if (out && typeof out === 'object' && 'image' in (out as Record<string, unknown>)) {
         const b64 = (out as { image: string }).image;
         const bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-        return new Response(bin, {
-          headers: { 'content-type': 'image/png', 'x-final-prompt': encodeURIComponent(finalPrompt) },
-        });
+        return new Response(bin, { headers: imageHeaders('image/png') });
       }
-      return new Response(out as BodyInit, {
-        headers: { 'content-type': 'image/png', 'x-final-prompt': encodeURIComponent(finalPrompt) },
-      });
+      return new Response(out as BodyInit, { headers: imageHeaders('image/png') });
     }
     const acc = body.accountId || env.CF_ACCOUNT_ID || '';
     const tok = body.apiKey || env.CF_API_TOKEN || '';
     if (!acc || !tok) {
-      return jsonRes({ error: '未绑定 Cloudflare Workers AI (env.AI) 或 CF_ACCOUNT_ID/CF_API_TOKEN' }, 400);
+      return jsonRes({ error: '未绑定 Cloudflare Workers AI (env.AI) 或 CF_ACCOUNT_ID/CF_API_TOKEN（或先切换至顶部 Pollinations 免 Key 引擎）' }, 400);
     }
     const upstream = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(acc)}/ai/run/${model}`, {
       method: 'POST',
@@ -905,10 +1220,7 @@ export async function handleEdgeRequest(request: Request, env: CFEnv): Promise<R
     });
     if (!upstream.ok) return jsonRes({ error: await upstream.text() }, upstream.status);
     return new Response(upstream.body, {
-      headers: {
-        'content-type': upstream.headers.get('content-type') || 'image/png',
-        'x-final-prompt': encodeURIComponent(finalPrompt),
-      },
+      headers: imageHeaders(upstream.headers.get('content-type') || 'image/png'),
     });
   }
 

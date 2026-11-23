@@ -77,6 +77,8 @@ export interface ProjectStatusLightsProps {
   generatedChars: number;
   hasUnclosedCode: boolean;
   autoContinue: boolean;
+  autoContinueRound?: number;
+  completenessDetail?: string;
   onToggleAutoContinue: () => void;
   onExportProjectZip?: () => void;
   canExportZip: boolean;
@@ -96,6 +98,8 @@ export const ProjectStatusLights: React.FC<ProjectStatusLightsProps> = ({
   generatedChars,
   hasUnclosedCode,
   autoContinue,
+  autoContinueRound = 0,
+  completenessDetail,
   onToggleAutoContinue,
   onExportProjectZip,
   canExportZip,
@@ -148,7 +152,7 @@ export const ProjectStatusLights: React.FC<ProjectStatusLightsProps> = ({
     },
     continuing: {
       dot: 'bg-cyan-500 animate-pulse shadow-[0_0_8px_rgba(6,182,212,0.75)]',
-      label: '④ 防中断自动续写中…',
+      label: autoContinueRound > 0 ? `④ 第 ${autoContinueRound} 轮防中断自动续写…` : '④ 防中断自动续写中…',
       text: 'text-cyan-700 dark:text-cyan-300 font-medium',
     },
     paused: {
@@ -158,7 +162,7 @@ export const ProjectStatusLights: React.FC<ProjectStatusLightsProps> = ({
     },
     truncated: {
       dot: 'bg-amber-500 animate-pulse',
-      label: '长输出分段截断 · 待续写',
+      label: completenessDetail ? `未完整 · ${completenessDetail}` : '长输出分段截断 · 待续写',
       text: 'text-amber-700 dark:text-amber-300 font-medium',
     },
     error: {
@@ -167,9 +171,12 @@ export const ProjectStatusLights: React.FC<ProjectStatusLightsProps> = ({
       text: 'text-red-700 dark:text-red-400 font-medium',
     },
     done: {
-      dot: 'bg-emerald-600',
-      label: codeBlockCount > 0 ? '编写完成 · 代码完整' : '生成完成',
-      text: 'text-emerald-700 dark:text-emerald-400',
+      dot: 'bg-emerald-600 shadow-[0_0_6px_rgba(5,150,105,0.65)]',
+      label:
+        codeBlockCount > 0
+          ? `✅ 项目已完整写出并自动停止${autoContinueRound > 0 ? ` (续写${autoContinueRound}轮)` : ''}`
+          : '✅ 生成完成并已停止',
+      text: 'text-emerald-700 dark:text-emerald-400 font-medium',
     },
   };
 

@@ -32,7 +32,8 @@ interface SettingsModalProps {
   onClose: () => void;
   isAdmin: boolean;
   requireLoginGate: boolean;
-  onToggleLoginGate: (enabled: boolean) => Promise<void>;
+  onToggleLoginGate: (enabled: boolean, initialPassword?: string) => Promise<void>;
+  onLockGateNow?: () => Promise<void> | void;
   providers: ExternalProvider[];
   providerStatuses: Record<string, ProviderStatusInfo>;
   publicConfig: PublicConfig | null;
@@ -67,6 +68,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   isAdmin,
   requireLoginGate,
   onToggleLoginGate,
+  onLockGateNow,
   providers,
   providerStatuses,
   publicConfig,
@@ -86,9 +88,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 }) => {
   const [tab, setTab] = useState<'providers' | 'guides' | 'appearance'>(initialTab);
   const [togglingGate, setTogglingGate] = useState(false);
+  const [gateInitPw, setGateInitPw] = useState('');
+  const [gateSwitchError, setGateSwitchError] = useState('');
 
   useEffect(() => {
     if (open) {
+      setGateSwitchError('');
       if (initialTab === 'providers' && !isAdmin) setTab('guides');
       else setTab(initialTab);
     }
@@ -312,54 +317,99 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           ) : tab === 'providers' && isAdmin ? (
             <>
               {/* Site-wide Admin Login Gate Toggle */}
-              <div className="rounded-xl border wb-border wb-bg p-4 flex flex-wrap items-center justify-between gap-3">
-                <div className="space-y-1 min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <ShieldCheck className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
-                    <span className="text-sm font-semibold wb-ink">全站访问限制开关（管理员登录门禁）</span>
-                    <span
-                      className={`px-2 py-0.5 rounded-md text-[11px] font-medium ${
-                        requireLoginGate
-                          ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30'
-                          : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30'
-                      }`}
-                    >
-                      {requireLoginGate ? '已开启全站拦截' : '已关闭（免登录开放）'}
-                    </span>
+              <div className="rounded-xl border wb-border wb-bg p-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="space-y-1 min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <ShieldCheck className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+                      <span className="text-sm font-semibold wb-ink">全站访问限制开关（管理员登录门禁）</span>
+                      <span
+                        className={`px-2 py-0.5 rounded-md text-[11px] font-medium ${
+                          requireLoginGate
+                            ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30'
+                            : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30'
+                        }`}
+                      >
+                        {requireLoginGate ? '已开启全站拦截' : '已关闭（免登录开放）'}
+                      </span>
+                    </div>
+                    <p className="text-xs wb-muted leading-relaxed">
+                      打开后，未登录的访客将被全屏管理员登录界面挡住主界面（同时后端严格拦截未授权对话、绘图、模型探测与部署下载接口），仅管理员登录后方可使用全部功能。
+                    </p>
                   </div>
-                  <p className="text-xs wb-muted leading-relaxed">
-                    打开后，未登录的访客将被全屏管理员登录界面挡住主界面（同时后端拦截未授权对话、绘图与模型探测请求），仅管理员登录后方可使用全部功能。
-                  </p>
+
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    {requireLoginGate && onLockGateNow && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          await onLockGateNow();
+                          onClose();
+                        }}
+                        className="h-9 px-3 rounded-lg border border-amber-400/60 bg-amber-500/10 text-xs font-medium text-amber-700 dark:text-amber-300 hover:bg-amber-500/20"
+                      >
+                        立即锁屏验证
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={requireLoginGate}
+                      disabled={togglingGate}
+                      onClick={async () => {
+                        setGateSwitchError('');
+                        if (!requireLoginGate && !publicConfig?.hasAdminPassword && gateInitPw.trim().length < 4) {
+                          setGateSwitchError('开启前请先设置至少 4 位管理员密码（或在环境变量中配置 ACCESS_PASSWORD），避免锁死无法解锁。');
+                          return;
+                        }
+                        setTogglingGate(true);
+                        try {
+                          await onToggleLoginGate(
+                            !requireLoginGate,
+                            !requireLoginGate && gateInitPw.trim() ? gateInitPw.trim() : undefined
+                          );
+                          setGateInitPw('');
+                        } catch (err: any) {
+                          setGateSwitchError(err?.message || '切换全站门禁失败');
+                        } finally {
+                          setTogglingGate(false);
+                        }
+                      }}
+                      className={`h-9 px-3.5 rounded-lg border text-xs font-medium inline-flex items-center gap-2 transition-colors shrink-0 ${
+                        requireLoginGate
+                          ? 'bg-blue-600 border-blue-600 text-white hover:bg-blue-700'
+                          : 'wb-panel wb-border wb-ink hover:opacity-80'
+                      } disabled:opacity-50`}
+                    >
+                      <Lock className="w-3.5 h-3.5" />
+                      <span>
+                        {togglingGate
+                          ? '切换中...'
+                          : requireLoginGate
+                          ? '已开启 · 点击关闭'
+                          : '已关闭 · 点击开启'}
+                      </span>
+                    </button>
+                  </div>
                 </div>
 
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={requireLoginGate}
-                  disabled={togglingGate}
-                  onClick={async () => {
-                    setTogglingGate(true);
-                    try {
-                      await onToggleLoginGate(!requireLoginGate);
-                    } finally {
-                      setTogglingGate(false);
-                    }
-                  }}
-                  className={`h-9 px-3.5 rounded-lg border text-xs font-medium inline-flex items-center gap-2 transition-colors shrink-0 ${
-                    requireLoginGate
-                      ? 'bg-blue-600 border-blue-600 text-white hover:bg-blue-700'
-                      : 'wb-panel wb-border wb-ink hover:opacity-80'
-                  } disabled:opacity-50`}
-                >
-                  <Lock className="w-3.5 h-3.5" />
-                  <span>
-                    {togglingGate
-                      ? '切换中...'
-                      : requireLoginGate
-                      ? '已开启 · 点击关闭'
-                      : '已关闭 · 点击开启'}
-                  </span>
-                </button>
+                {!requireLoginGate && !publicConfig?.hasAdminPassword && (
+                  <div className="pt-2 border-t wb-border flex flex-col sm:flex-row sm:items-center gap-2">
+                    <span className="text-xs wb-muted shrink-0">首次开启需同步设定管理员密码：</span>
+                    <input
+                      type="password"
+                      value={gateInitPw}
+                      onChange={(e) => setGateInitPw(e.target.value)}
+                      placeholder="输入至少 4 位管理员解锁密码"
+                      className="flex-1 h-9 px-3 rounded-lg border wb-border wb-panel text-xs wb-ink focus:outline-none"
+                    />
+                  </div>
+                )}
+
+                {gateSwitchError && (
+                  <div className="text-xs text-red-600 dark:text-red-400">{gateSwitchError}</div>
+                )}
               </div>
 
               {/* Header controls */}

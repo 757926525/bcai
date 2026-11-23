@@ -61,7 +61,13 @@ import {
   ThemeId,
   WorkspaceMode,
 } from './types';
-import { hasUnclosedCodeFence, LANG_EXT_MAP } from './utils/codeBlocks';
+import {
+  analyzeProjectCompleteness,
+  hasUnclosedCodeFence,
+  hasUnclosedThinkBlock,
+  LANG_EXT_MAP,
+  trimContinuationPrefix,
+} from './utils/codeBlocks';
 import { formatTimeShort, loadLocalJson, saveLocalJson, uid } from './utils/format';
 
 const LS_CONVS = 'bcai.convs.v3';
@@ -203,9 +209,16 @@ export default function App() {
     saveLocalJson(LS_LAYOUT_MODE, layoutMode);
   }, [layoutMode]);
 
-  // Admin Session (HttpOnly/Partitioned cookie primary + in-memory fallback, never persisted in localStorage)
+  // Admin Session (HttpOnly/Partitioned cookie primary + synchronous in-memory ref fallback, never persisted in localStorage)
+  const adminTokenRef = useRef<string>('');
   const [adminToken, setAdminToken] = useState<string>('');
   const [isAdmin, setIsAdmin] = useState<boolean>(false);
+  const [authChecked, setAuthChecked] = useState<boolean>(false);
+
+  const syncAdminToken = useCallback((token: string) => {
+    adminTokenRef.current = token;
+    setAdminToken(token);
+  }, []);
 
   useEffect(() => {
     try {
@@ -225,8 +238,9 @@ export default function App() {
         if (!headers.has('x-requested-with')) {
           headers.set('X-Requested-With', 'XMLHttpRequest');
         }
-        if (adminToken && !headers.has('x-admin-token')) {
-          headers.set('x-admin-token', adminToken);
+        const activeToken = adminTokenRef.current || adminToken;
+        if (activeToken && !headers.has('x-admin-token')) {
+          headers.set('x-admin-token', activeToken);
         }
         return origFetch(input, { ...init, headers });
       }
@@ -254,10 +268,6 @@ export default function App() {
     const found = conversations.find((c) => c.id === activeId);
     return found || conversations[0];
   }, [conversations, activeId]);
-
-  useEffect(() => {
-    saveLocalJson(LS_CONVS, conversations);
-  }, [conversations]);
 
   useEffect(() => {
     if (activeConv) saveLocalJson(LS_ACTIVE, activeConv.id);
@@ -303,6 +313,9 @@ export default function App() {
       return p;
     });
   });
+
+  const providersRef = useRef<ExternalProvider[]>(providers);
+  providersRef.current = providers;
 
   useEffect(() => {
     saveLocalJson(LS_PROVIDERS, providers);
@@ -377,19 +390,37 @@ export default function App() {
   const [activeStreamModel, setActiveStreamModel] = useState<string>('');
   const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
   const [autoContinue, setAutoContinue] = useState<boolean>(() => loadLocalJson<boolean>(LS_AUTO_CONTINUE, true));
+  const [autoContinueRound, setAutoContinueRound] = useState<number>(0);
+  const [completenessDetail, setCompletenessDetail] = useState<string>('');
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     saveLocalJson(LS_AUTO_CONTINUE, autoContinue);
   }, [autoContinue]);
 
+  // Debounce localStorage writes while streaming at high token throughput; flush immediately when idle
+  useEffect(() => {
+    if (!isStreaming) {
+      saveLocalJson(LS_CONVS, conversations);
+      return;
+    }
+    const timer = setTimeout(() => {
+      saveLocalJson(LS_CONVS, conversations);
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [conversations, isStreaming]);
+
   useEffect(() => {
     if (!isStreaming) {
       setWritePhase('idle');
+      setAutoContinueRound(0);
+      setCompletenessDetail('');
       setActiveStreamModel('');
       setStreamStartedAt(null);
     }
-  }, [activeId, isStreaming]);
+    // Only reset status lights when switching conversations, NOT when stream finishes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId]);
 
   const refreshConnectors = useCallback(async () => {
     if (!isAdmin) {
@@ -422,9 +453,11 @@ export default function App() {
     }
   }, [isAdmin]);
 
-  const loadConfigAndAuth = useCallback(async () => {
+  const loadConfigAndAuth = useCallback(async (tokenOverride?: string) => {
     try {
-      const res = await fetch('/api/config/public');
+      const initHeaders: Record<string, string> = {};
+      if (tokenOverride) initHeaders['x-admin-token'] = tokenOverride;
+      const res = await fetch('/api/config/public', tokenOverride ? { headers: initHeaders } : undefined);
       if (res.ok) {
         const cfg = (await res.json()) as PublicConfig;
         setPublicConfig(cfg);
@@ -456,10 +489,11 @@ export default function App() {
 
         // Auto-select an active configured model for empty initial conversations if Workers AI is unconfigured
         if (!cfg.envProviders.workersAi) {
+          const currentProviders = providersRef.current;
           setConversations((prev) =>
             prev.map((c) => {
               if (c.messages.length === 0 && c.providerId === 'builtin-workers-ai') {
-                const best = pickBestDefaultModel(c.mode, cfg, providers);
+                const best = pickBestDefaultModel(c.mode, cfg, currentProviders);
                 if (best.providerId !== 'builtin-workers-ai') {
                   return { ...c, modelId: best.modelId, providerId: best.providerId };
                 }
@@ -471,8 +505,10 @@ export default function App() {
       }
     } catch {
       // ignore
+    } finally {
+      setAuthChecked(true);
     }
-  }, [providers]);
+  }, []);
 
   useEffect(() => {
     loadConfigAndAuth();
@@ -727,6 +763,8 @@ export default function App() {
     return systemPrompt;
   };
 
+  const MAX_AUTO_CONTINUE_ROUNDS = 6;
+
   const executeStream = async (
     convId: string,
     promptMessages: Array<{ role: string; content: string; attachments?: ChatAttachment[] }>,
@@ -737,23 +775,60 @@ export default function App() {
       continuationDepth?: number;
       existingContent?: string;
       systemPrompt?: string;
+      convMode?: 'chat' | 'code' | 'repo';
       historyBeforeAssistant?: Array<{ role: string; content: string; attachments?: ChatAttachment[] }>;
     }
   ) => {
-    const provider = providers.find((p) => p.id === providerId);
+    const provider = providersRef.current.find((p) => p.id === providerId);
     const ac = new AbortController();
     abortRef.current = ac;
 
     const continuationDepth = options?.continuationDepth ?? 0;
+    const convMode = options?.convMode || 'code';
     let accumulated = options?.existingContent ?? '';
     const wasInsideUnclosedFence = continuationDepth > 0 && hasUnclosedCodeFence(accumulated);
-    let checkedContinuationFence = false;
+    const wasInsideUnclosedThink = continuationDepth > 0 && hasUnclosedThinkBlock(accumulated);
+
+    let prefixBuffered = continuationDepth === 0;
+    let prefixBuffer = '';
+    let roundAddedChars = 0;
     let willAutoContinue = false;
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    let writingPhaseSignaled = false;
+
+    const flushAccumulatedToUI = () => {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      setConversations((prev) =>
+        prev.map((c) => {
+          if (c.id !== convId) return c;
+          return {
+            ...c,
+            updatedAt: new Date().toISOString(),
+            messages: c.messages.map((m) =>
+              m.id === assistantMsgId ? { ...m, content: accumulated } : m
+            ),
+          };
+        })
+      );
+    };
+
+    const scheduleFlush = () => {
+      if (!flushTimer) {
+        flushTimer = setTimeout(() => {
+          flushAccumulatedToUI();
+        }, 45);
+      }
+    };
 
     setIsStreaming(true);
+    setAutoContinueRound(continuationDepth);
     if (continuationDepth === 0) {
       setStreamStartedAt(Date.now());
       setActiveStreamModel(modelId);
+      setCompletenessDetail('');
       setWritePhase('connecting');
     } else {
       setWritePhase('continuing');
@@ -784,58 +859,99 @@ export default function App() {
           }
         },
         onChunk: (delta) => {
-          let cleanDelta = delta;
-          if (wasInsideUnclosedFence && !checkedContinuationFence) {
-            checkedContinuationFence = true;
-            // Strip redundant opening code fence if continuation model re-opened a fence mid-block
-            const stripped = cleanDelta.replace(/^\s*```[^\n]*\n/, '');
-            if (stripped !== cleanDelta) {
-              cleanDelta = stripped;
-            } else if (accumulated && !accumulated.endsWith('\n') && !cleanDelta.startsWith('\n')) {
-              cleanDelta = '\n' + cleanDelta;
+          if (!prefixBuffered) {
+            prefixBuffer += delta;
+            if (prefixBuffer.length < 48 && !prefixBuffer.includes('\n')) {
+              return;
             }
-          } else if (continuationDepth > 0 && !checkedContinuationFence) {
-            checkedContinuationFence = true;
-            if (accumulated && !accumulated.endsWith('\n') && !cleanDelta.startsWith('\n')) {
-              cleanDelta = '\n' + cleanDelta;
-            }
+            const cleanStart = trimContinuationPrefix(
+              accumulated,
+              prefixBuffer,
+              wasInsideUnclosedFence,
+              wasInsideUnclosedThink
+            );
+            prefixBuffered = true;
+            prefixBuffer = '';
+            accumulated += cleanStart;
+            roundAddedChars += cleanStart.length;
+          } else {
+            accumulated += delta;
+            roundAddedChars += delta.length;
           }
 
-          accumulated += cleanDelta;
-          setWritePhase((prev) => (prev === 'continuing' ? 'continuing' : 'writing'));
-
-          setConversations((prev) =>
-            prev.map((c) => {
-              if (c.id !== convId) return c;
-              return {
-                ...c,
-                updatedAt: new Date().toISOString(),
-                messages: c.messages.map((m) =>
-                  m.id === assistantMsgId ? { ...m, content: accumulated } : m
-                ),
-              };
-            })
-          );
+          if (!writingPhaseSignaled) {
+            writingPhaseSignaled = true;
+            setWritePhase(continuationDepth > 0 ? 'continuing' : 'writing');
+          }
+          scheduleFlush();
         },
         onDone: async (result) => {
-          const needsContinuation =
-            Boolean(result.truncated || result.interrupted || hasUnclosedCodeFence(accumulated)) &&
-            accumulated.trim().length > 0 &&
-            !ac.signal.aborted;
+          // Flush any short un-emitted prefix buffer from continuation round
+          if (!prefixBuffered && prefixBuffer) {
+            const cleanStart = trimContinuationPrefix(
+              accumulated,
+              prefixBuffer,
+              wasInsideUnclosedFence,
+              wasInsideUnclosedThink
+            );
+            prefixBuffered = true;
+            prefixBuffer = '';
+            accumulated += cleanStart;
+            roundAddedChars += cleanStart.length;
+          }
+          flushAccumulatedToUI();
 
-          if (needsContinuation && autoContinue && continuationDepth < 2 && options?.historyBeforeAssistant) {
+          const report = analyzeProjectCompleteness(accumulated, convMode, result);
+          const meaningfulProgress =
+            continuationDepth === 0 || roundAddedChars >= 12 || hasUnclosedCodeFence(accumulated);
+
+          if (
+            report.incomplete &&
+            autoContinue &&
+            continuationDepth < MAX_AUTO_CONTINUE_ROUNDS &&
+            accumulated.trim().length > 0 &&
+            !ac.signal.aborted &&
+            meaningfulProgress
+          ) {
             willAutoContinue = true;
+            const nextRound = continuationDepth + 1;
+            setAutoContinueRound(nextRound);
+            setCompletenessDetail(report.detail);
             setWritePhase('continuing');
+            showToast(`检测到尚未完整输出（${report.detail}），正自动发起第 ${nextRound} 轮防中断续写…`);
+
+            const tailWindow = accumulated.slice(-14000);
+            const firstUserPrompt =
+              options?.historyBeforeAssistant?.find((m) => m.role === 'user')?.content?.slice(0, 2000) || '';
+            const filesSummary =
+              report.writtenFiles.length > 0
+                ? `已输出的代码文件/模块：${report.writtenFiles.join(', ')}`
+                : '尚未出现完整代码块';
+            const missingHint =
+              report.missingFiles.length > 0
+                ? `\n仍待补全的目标文件：${report.missingFiles.join(', ')}`
+                : '';
+
             const nextMessages = [
-              { role: 'system', content: options.systemPrompt || SYSTEM_PROMPTS.code },
-              ...options.historyBeforeAssistant,
-              { role: 'assistant', content: accumulated },
+              { role: 'system', content: options?.systemPrompt || SYSTEM_PROMPTS[convMode] },
+              ...(firstUserPrompt
+                ? [{ role: 'user', content: `原始完整任务需求：\n${firstUserPrompt}` }]
+                : []),
+              {
+                role: 'assistant',
+                content: `[前序已生成 ${accumulated.length} 字符。${filesSummary}]\n\n...${tailWindow}`,
+              },
               {
                 role: 'user',
                 content:
-                  '请紧接着上面未完成的位置继续输出，不要重复已生成的开头内容，直接衔接正文或补全未闭合代码块，并确保全部代码完整收尾。',
+                  `断点续写指令（第 ${nextRound} 轮）：上面回复在结尾处尚未写完（原因：${report.detail}）。${missingHint}\n` +
+                  `请紧接着上面最后一行代码或正文**无缝继续输出**剩余内容：\n` +
+                  `1. 若处于代码块内部，请**直接输出后续代码**并在文件写完后用 \`\`\` 闭合，切勿重复 \`\`\`lang 开头或重写已完成的代码；\n` +
+                  `2. 若还有未输出的项目文件，请逐个使用 \`\`\`lang path/to/file.ext 完整写出全部剩余文件（严禁省略占位）；\n` +
+                  `3. 当所有文件与说明均已完整交付时，正常结束输出即可。`,
               },
             ];
+
             await executeStream(
               convId,
               nextMessages,
@@ -843,10 +959,11 @@ export default function App() {
               result.activeModel || modelId,
               providerId,
               {
-                continuationDepth: continuationDepth + 1,
+                continuationDepth: nextRound,
                 existingContent: accumulated,
-                systemPrompt: options.systemPrompt,
-                historyBeforeAssistant: options.historyBeforeAssistant,
+                systemPrompt: options?.systemPrompt,
+                convMode,
+                historyBeforeAssistant: options?.historyBeforeAssistant,
               }
             );
             return;
@@ -854,8 +971,19 @@ export default function App() {
 
           setIsStreaming(false);
           abortRef.current = null;
-          const stillIncomplete = Boolean(result.truncated || result.interrupted || hasUnclosedCodeFence(accumulated));
+          setCompletenessDetail(report.detail);
+          setAutoContinueRound(continuationDepth);
+
+          const stillIncomplete = Boolean(report.incomplete && accumulated.trim().length > 0);
           setWritePhase(stillIncomplete ? 'truncated' : 'done');
+
+          if (accumulated.trim().length > 0) {
+            if (!stillIncomplete) {
+              showToast(`✅ ${report.detail}，已自动停止续写`);
+            } else {
+              showToast(`⚠️ ${report.detail}（可点击下方「立即续写完成」）`);
+            }
+          }
 
           setConversations((prev) =>
             prev.map((c) => {
@@ -875,8 +1003,11 @@ export default function App() {
                   return {
                     ...m,
                     modelId: result.activeModel || m.modelId,
-                    truncated: result.truncated || hasUnclosedCodeFence(accumulated),
-                    interrupted: result.interrupted,
+                    truncated: stillIncomplete,
+                    interrupted: stillIncomplete ? Boolean(result.interrupted) : false,
+                    paused: false,
+                    completedCleanly: !stillIncomplete,
+                    autoContinuedRounds: continuationDepth,
                     finishReason: result.finishReason,
                   };
                 }),
@@ -886,10 +1017,17 @@ export default function App() {
         },
         onError: (err) => {
           if (willAutoContinue) return;
+          if (!prefixBuffered && prefixBuffer) {
+            accumulated += prefixBuffer;
+            prefixBuffer = '';
+            prefixBuffered = true;
+          }
+          flushAccumulatedToUI();
           setIsStreaming(false);
           abortRef.current = null;
           const isAbort = err.name === 'AbortError';
           setWritePhase(isAbort ? 'paused' : 'error');
+          setCompletenessDetail(isAbort ? '已手动暂停，可随时断点续写' : err.message);
           setConversations((prev) =>
             prev.map((c) => {
               if (c.id !== convId) return c;
@@ -902,12 +1040,14 @@ export default function App() {
                     return {
                       ...m,
                       paused: true,
+                      autoContinuedRounds: continuationDepth,
                       content: accumulated || '（已暂停生成）',
                     };
                   }
                   return {
                     ...m,
                     interrupted: true,
+                    autoContinuedRounds: continuationDepth,
                     content: `${accumulated ? accumulated + '\n\n' : ''}⚠️ ${err.message}`,
                   };
                 }),
@@ -975,6 +1115,7 @@ export default function App() {
         continuationDepth: 0,
         existingContent: '',
         systemPrompt,
+        convMode: activeConv.mode,
         historyBeforeAssistant,
       }
     );
@@ -998,7 +1139,14 @@ export default function App() {
               ...c,
               messages: c.messages.map((m) =>
                 m.id === assistantMsgId
-                  ? { ...m, content: cleanContent, paused: false, truncated: false, interrupted: false }
+                  ? {
+                      ...m,
+                      content: cleanContent,
+                      paused: false,
+                      truncated: false,
+                      interrupted: false,
+                      completedCleanly: false,
+                    }
                   : m
               ),
             }
@@ -1012,13 +1160,23 @@ export default function App() {
       content: m.content,
       attachments: m.attachments,
     }));
+    const report = analyzeProjectCompleteness(cleanContent, activeConv.mode);
+    const tailWindow = cleanContent.slice(-14000);
+    const firstUserPrompt =
+      historyBeforeAssistant.find((m) => m.role === 'user')?.content?.slice(0, 2000) || '';
     const payloadMessages = [
       { role: 'system', content: systemPrompt },
-      ...historyBeforeAssistant,
-      { role: 'assistant', content: cleanContent },
+      ...(firstUserPrompt ? [{ role: 'user', content: `原始完整任务需求：\n${firstUserPrompt}` }] : []),
+      {
+        role: 'assistant',
+        content: `[前序已生成 ${cleanContent.length} 字符]\n\n...${tailWindow}`,
+      },
       {
         role: 'user',
-        content: '请紧接着上一条未完成的内容继续输出，不要重复已生成部分，直接补全剩余代码或说明。',
+        content:
+          `请紧接着上面最后一行无缝继续输出剩余内容（${report.detail}）。` +
+          (report.missingFiles.length > 0 ? `仍待补全文件：${report.missingFiles.join(', ')}。` : '') +
+          `不要重复前面已完成的代码，若当前处于未闭合代码块内部直接接续代码并在结束时用 \`\`\` 闭合。`,
       },
     ];
 
@@ -1029,9 +1187,10 @@ export default function App() {
       activeConv.modelId,
       activeConv.providerId,
       {
-        continuationDepth: 0,
+        continuationDepth: (last.autoContinuedRounds || 0) + 1,
         existingContent: cleanContent,
         systemPrompt,
+        convMode: activeConv.mode,
         historyBeforeAssistant,
       }
     );
@@ -1148,19 +1307,41 @@ export default function App() {
   };
 
   // Login Gate & Connector Code Save Handlers
-  const handleToggleLoginGate = async (enabled: boolean) => {
+  const handleToggleLoginGate = async (enabled: boolean, initialPassword?: string) => {
     const res = await fetch('/api/auth/login-gate', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ enabled }),
+      body: JSON.stringify({ enabled, initialPassword }),
     });
-    const data = (await res.json()) as { ok?: boolean; requireLoginGate?: boolean; message?: string; error?: string };
+    const data = (await res.json()) as {
+      ok?: boolean;
+      requireLoginGate?: boolean;
+      hasAdminPassword?: boolean;
+      message?: string;
+      error?: string;
+    };
     if (!res.ok) {
       showToast(data.error || '切换全站登录门禁失败');
       throw new Error(data.error || '切换全站登录门禁失败');
     }
-    setPublicConfig((prev) => (prev ? { ...prev, requireLoginGate: Boolean(data.requireLoginGate) } : prev));
+    setPublicConfig((prev) =>
+      prev
+        ? {
+            ...prev,
+            requireLoginGate: Boolean(data.requireLoginGate),
+            hasAdminPassword: data.hasAdminPassword ?? prev.hasAdminPassword,
+          }
+        : prev
+    );
     showToast(data.message || (enabled ? '已开启全站访问限制' : '已关闭全站访问限制'));
+  };
+
+  const handleLockGateNow = async () => {
+    await fetch('/api/auth/admin-logout', { method: 'POST' });
+    syncAdminToken('');
+    setIsAdmin(false);
+    showToast('已退出管理员会话，全站访问门禁已生效锁屏');
+    await loadConfigAndAuth('');
   };
 
   const handleGateLogin = async (e: React.FormEvent) => {
@@ -1178,12 +1359,13 @@ export default function App() {
         setGateErr(data.error || '管理员密码验证失败');
         return;
       }
-      setAdminToken(data.adminToken || '');
+      const nextTok = data.adminToken || '';
+      syncAdminToken(nextTok);
       setIsAdmin(true);
       setGatePw('');
       setGateErr('');
       showToast('管理员已登录，工作台已解锁');
-      loadConfigAndAuth();
+      await loadConfigAndAuth(nextTok);
     } catch {
       setGateErr('网络异常，无法连接鉴权服务');
     } finally {
@@ -1372,6 +1554,18 @@ export default function App() {
 
   // Mobile-simulation outer frame when user manually picks 'mobile' on desktop
   const forcedMobileShell = layoutMode === 'mobile' && windowWidth >= 768;
+
+  // Wait for initial publicConfig + auth state check to prevent workspace flicker when gate is enabled
+  if (!authChecked) {
+    return (
+      <div className="min-h-dvh w-full wb-bg wb-ink flex flex-col items-center justify-center p-4">
+        <div className="flex items-center gap-3 text-xs wb-muted">
+          <span className="w-4 h-4 rounded-full border-2 border-blue-600 border-t-transparent animate-spin" />
+          <span>正在加载工作台安全配置…</span>
+        </div>
+      </div>
+    );
+  }
 
   // Site-wide Admin Login Gate: block entire workspace when enabled & not admin
   if (publicConfig?.requireLoginGate && !isAdmin) {
@@ -1999,6 +2193,8 @@ export default function App() {
                 activeStreamModel={activeStreamModel}
                 streamStartedAt={streamStartedAt}
                 autoContinue={autoContinue}
+                autoContinueRound={autoContinueRound}
+                completenessDetail={completenessDetail}
                 onToggleAutoContinue={() => setAutoContinue((v) => !v)}
                 isAdmin={isAdmin}
                 isMobileLayout={isMobileLayout}
@@ -2042,6 +2238,8 @@ export default function App() {
                 activeStreamModel={activeStreamModel}
                 streamStartedAt={streamStartedAt}
                 autoContinue={autoContinue}
+                autoContinueRound={autoContinueRound}
+                completenessDetail={completenessDetail}
                 onToggleAutoContinue={() => setAutoContinue((v) => !v)}
                 isAdmin={isAdmin}
                 isMobileLayout={isMobileLayout}
@@ -2096,17 +2294,20 @@ export default function App() {
         selectedPlan={settings.plan}
         onSelectPlan={(plan) => setSettings((prev) => ({ ...prev, plan }))}
         isAdmin={isAdmin}
+        requireLoginGate={Boolean(publicConfig?.requireLoginGate)}
+        onToggleLoginGate={handleToggleLoginGate}
+        onLockGateNow={handleLockGateNow}
         onAdminLoggedIn={(token) => {
-          setAdminToken(token);
+          syncAdminToken(token);
           setIsAdmin(true);
           showToast('管理员已登录，管理功能区已解锁');
-          loadConfigAndAuth();
+          loadConfigAndAuth(token);
         }}
         onAdminLoggedOut={() => {
-          setAdminToken('');
+          syncAdminToken('');
           setIsAdmin(false);
           showToast('已退出管理员登录');
-          loadConfigAndAuth();
+          loadConfigAndAuth('');
         }}
         onPasswordUpdated={(msg) => {
           showToast(msg);
@@ -2121,6 +2322,7 @@ export default function App() {
         isAdmin={isAdmin}
         requireLoginGate={Boolean(publicConfig?.requireLoginGate)}
         onToggleLoginGate={handleToggleLoginGate}
+        onLockGateNow={handleLockGateNow}
         providers={providers}
         providerStatuses={providerStatuses}
         publicConfig={publicConfig}

@@ -1,4 +1,11 @@
-import { ExternalProvider, ImageModelOption, ModelOption, ProviderGuide, ThemeId } from '../types';
+import {
+  ExternalImageProvider,
+  ExternalProvider,
+  ImageModelOption,
+  ModelOption,
+  ProviderGuide,
+  ThemeId,
+} from '../types';
 
 export interface ThemeDefinition {
   id: ThemeId;
@@ -121,41 +128,227 @@ export const ORIGINAL_WORKBENCH_MODELS: ModelOption[] = [
 ];
 
 export const ORIGINAL_IMAGE_MODELS: ImageModelOption[] = [
+  // 内置免 Key 免费引擎（Pollinations AI · 开箱即用）
+  {
+    id: 'pollinations:flux',
+    name: 'Pollinations FLUX.1（内置免 Key · 高精度通用）',
+    providerType: 'pollinations',
+    defaultSteps: 4,
+    maxSteps: 8,
+    supportsCustomSize: true,
+    supportsNegativePrompt: true,
+    supportsGuidance: false,
+    requiresKey: false,
+    quotaSummary: '内置免费 · 无需 API Key · 直接高清出图',
+  },
+  {
+    id: 'pollinations:flux-realism',
+    name: 'Pollinations FLUX Realism（内置免 Key · 写实摄影）',
+    providerType: 'pollinations',
+    defaultSteps: 4,
+    maxSteps: 8,
+    supportsCustomSize: true,
+    supportsNegativePrompt: true,
+    supportsGuidance: false,
+    requiresKey: false,
+    quotaSummary: '内置免费 · 无需 API Key · 真实光影人像风景',
+  },
+  {
+    id: 'pollinations:flux-anime',
+    name: 'Pollinations FLUX Anime（内置免 Key · 二次元插画）',
+    providerType: 'pollinations',
+    defaultSteps: 4,
+    maxSteps: 8,
+    supportsCustomSize: true,
+    supportsNegativePrompt: true,
+    supportsGuidance: false,
+    requiresKey: false,
+    quotaSummary: '内置免费 · 无需 API Key · 精细动漫立绘',
+  },
+  {
+    id: 'pollinations:flux-3d',
+    name: 'Pollinations FLUX 3D（内置免 Key · 3D/C4D 渲染）',
+    providerType: 'pollinations',
+    defaultSteps: 4,
+    maxSteps: 8,
+    supportsCustomSize: true,
+    supportsNegativePrompt: true,
+    supportsGuidance: false,
+    requiresKey: false,
+    quotaSummary: '内置免费 · 无需 API Key · 盲盒/建模质感',
+  },
+  {
+    id: 'pollinations:turbo',
+    name: 'Pollinations SDXL Turbo（内置免 Key · 极速响应）',
+    providerType: 'pollinations',
+    defaultSteps: 4,
+    maxSteps: 8,
+    supportsCustomSize: true,
+    supportsNegativePrompt: true,
+    supportsGuidance: false,
+    requiresKey: false,
+    quotaSummary: '内置免费 · 无需 API Key · 秒级预览出图',
+  },
+  // Cloudflare Workers AI 免费绘图模型
   {
     id: '@cf/black-forest-labs/flux-1-schnell',
-    name: 'FLUX.1 schnell（极速推荐）',
+    name: 'CF Workers AI · FLUX.1 schnell（极速高清）',
+    providerType: 'workers-ai',
     defaultSteps: 4,
     maxSteps: 8,
     supportsCustomSize: false,
     supportsNegativePrompt: false,
-    quotaSummary: 'Workers AI 免费 Neurons 额度',
+    supportsGuidance: false,
+    requiresKey: true,
+    quotaSummary: 'Workers AI 免费 10,000 Neurons/天（Pages 原生 env.AI 免 Key）',
+  },
+  {
+    id: '@cf/leonardo/lucid-origin',
+    name: 'CF Workers AI · Leonardo Lucid Origin（高审美细节）',
+    providerType: 'workers-ai',
+    defaultSteps: 20,
+    maxSteps: 25,
+    supportsCustomSize: true,
+    supportsNegativePrompt: true,
+    supportsGuidance: true,
+    requiresKey: true,
+    quotaSummary: 'Workers AI 免费额度 · 细节与构图表现优异',
+  },
+  {
+    id: '@cf/leonardo/phoenix-1.0',
+    name: 'CF Workers AI · Leonardo Phoenix 1.0（强文字/语义跟随）',
+    providerType: 'workers-ai',
+    defaultSteps: 20,
+    maxSteps: 25,
+    supportsCustomSize: true,
+    supportsNegativePrompt: true,
+    supportsGuidance: true,
+    requiresKey: true,
+    quotaSummary: 'Workers AI 免费额度 · 精准还原复杂提示词',
   },
   {
     id: '@cf/stabilityai/stable-diffusion-xl-base-1.0',
-    name: 'Stable Diffusion XL 1.0（支持负向词/CFG）',
+    name: 'CF Workers AI · SDXL 1.0（支持负向词与 CFG）',
+    providerType: 'workers-ai',
     defaultSteps: 20,
     maxSteps: 20,
     supportsCustomSize: true,
     supportsNegativePrompt: true,
+    supportsGuidance: true,
+    requiresKey: true,
     quotaSummary: 'Workers AI 免费 Neurons 额度',
   },
   {
     id: '@cf/bytedance/stable-diffusion-xl-lightning',
-    name: 'SDXL Lightning（4步快出 · 支持负向词）',
+    name: 'CF Workers AI · SDXL Lightning（4 步快出 · 支持负向词）',
+    providerType: 'workers-ai',
     defaultSteps: 4,
     maxSteps: 12,
     supportsCustomSize: true,
     supportsNegativePrompt: true,
+    supportsGuidance: true,
+    requiresKey: true,
     quotaSummary: 'Workers AI 免费 Neurons 额度',
   },
   {
     id: '@cf/lykon/dreamshaper-8-lcm',
-    name: 'DreamShaper 8 LCM（插画写实 · 支持负向词）',
+    name: 'CF Workers AI · DreamShaper 8 LCM（插画写实）',
+    providerType: 'workers-ai',
     defaultSteps: 8,
     maxSteps: 20,
     supportsCustomSize: true,
     supportsNegativePrompt: true,
+    supportsGuidance: true,
+    requiresKey: true,
     quotaSummary: 'Workers AI 免费 Neurons 额度',
+  },
+];
+
+export interface ImageStylePreset {
+  id: string;
+  label: string;
+  promptSuffix: string;
+  negativeSuffix: string;
+}
+
+export const IMAGE_STYLE_PRESETS: ImageStylePreset[] = [
+  {
+    id: 'none',
+    label: '默认原生（忠于描述）',
+    promptSuffix: '',
+    negativeSuffix: '',
+  },
+  {
+    id: 'photorealistic',
+    label: '电影级写实摄影',
+    promptSuffix: 'photorealistic, 8k uhd, natural lighting, cinematic depth of field, sharp focus, shot on 35mm lens',
+    negativeSuffix: 'cartoon, anime, 3d render, painting, artificial skin, blurry, overexposed',
+  },
+  {
+    id: 'anime',
+    label: '日系精致二次元',
+    promptSuffix: 'high quality anime illustration, crisp cel shading, vibrant lighting, expressive details, clean lineart',
+    negativeSuffix: 'photorealistic, 3d, deformed hands, extra fingers, muddy colors, lowres',
+  },
+  {
+    id: '3d-render',
+    label: 'C4D / Octane 3D 质感',
+    promptSuffix: 'octane render, 3d studio lighting, smooth subsurface scattering, volumetric light, clean geometric detail',
+    negativeSuffix: 'flat 2d sketch, noise, grainy, blurry, distorted geometry',
+  },
+  {
+    id: 'chinese-ink',
+    label: '国风意境水墨',
+    promptSuffix: 'traditional Chinese ink wash and mineral color painting, poetic atmosphere, delicate brushwork, rice paper texture',
+    negativeSuffix: 'modern neon, 3d plastic, harsh digital noise, cluttered',
+  },
+  {
+    id: 'cyberpunk',
+    label: '赛博朋克霓虹',
+    promptSuffix: 'cyberpunk sci-fi atmosphere, glowing neon reflections on wet surfaces, dramatic rim light, high contrast',
+    negativeSuffix: 'daylight flat lighting, washed out, low contrast, blurry',
+  },
+  {
+    id: 'ui-design',
+    label: 'UI / 产品概念图',
+    promptSuffix: 'clean modern studio product photography, minimal composition, soft diffused studio light, high-end industrial design',
+    negativeSuffix: 'cluttered background, messy text, watermark, distorted typography',
+  },
+  {
+    id: 'flat-illustration',
+    label: '极简矢量扁平插画',
+    promptSuffix: 'modern editorial vector illustration, balanced geometric shapes, harmonious color palette, crisp edges',
+    negativeSuffix: 'photorealistic noise, 3d shading, muddy gradients, messy lines',
+  },
+];
+
+export const DEFAULT_EXTERNAL_IMAGE_PROVIDERS: ExternalImageProvider[] = [
+  {
+    id: 'img-siliconflow-kolors',
+    name: '硅基流动 Kolors 可图（永久免费中文绘图）',
+    providerType: 'siliconflow',
+    baseUrl: 'https://api.siliconflow.cn/v1/images/generations',
+    apiKey: '',
+    modelId: 'Kwai-Kolors/Kolors',
+    enabled: true,
+  },
+  {
+    id: 'img-hf-flux',
+    name: 'Hugging Face FLUX.1-dev（免费推理 Token）',
+    providerType: 'huggingface',
+    baseUrl: 'https://router.huggingface.co/hf-inference/models',
+    apiKey: '',
+    modelId: 'black-forest-labs/FLUX.1-dev',
+    enabled: true,
+  },
+  {
+    id: 'img-openai-compat',
+    name: '通用 OpenAI Images 兼容接口',
+    providerType: 'openai-image',
+    baseUrl: 'https://api.together.xyz/v1/images/generations',
+    apiKey: '',
+    modelId: 'black-forest-labs/FLUX.1-schnell-Free',
+    enabled: true,
   },
 ];
 
@@ -671,8 +864,8 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
 
 export const SYSTEM_PROMPTS: Record<'chat' | 'code' | 'repo', string> = {
   chat: '你是一个专业、严谨的多模态 AI 助手。默认使用用户提问的语言回答，结合附带的文件或图片给出准确直接的分析。',
-  code: '你是资深全栈软件工程师。请始终输出完整、可直接运行的真实代码，严禁使用“// ... 其余省略”或占位伪代码。多文件项目请在每个 Markdown 代码块首行标注相对文件路径（例如 ```tsx src/App.tsx 或 ```ts src/utils/api.ts ），先给完整代码，再简明说明运行与关键设计点。默认使用中文回答。',
-  repo: '你是代码仓库协同工程专家。请严格结合用户提供的代码仓库分支、目录与文件内容上下文进行分析、重构或生成可直接提交推送的完整代码。多文件输出请在代码块首行标注仓库路径（例如 ```ts src/server.ts ），严禁省略关键逻辑。默认使用中文回答。',
+  code: '你是资深全栈软件工程师。请严格遵守：\n1. 始终一次性写出完整、可直接运行、零占位符的真实工程代码，严禁使用“// ... 其余省略”、“此处略过”或伪代码。\n2. 多文件项目必须在每个 Markdown 代码块首行标注相对文件路径（例如 ```tsx src/App.tsx 或 ```ts src/utils/api.ts ），先列出简洁的目录结构，再逐个完整输出每个文件的代码，最后简明给出运行命令与要点。\n3. 确保所有代码块 ``` 正确闭合且逻辑完整闭环；默认使用中文回答。',
+  repo: '你是代码仓库协同工程专家。请严格结合用户提供的代码仓库分支、目录与文件内容上下文进行分析、重构或生成可直接提交推送的完整代码。多文件输出请在代码块首行标注仓库路径（例如 ```ts src/server.ts ），严禁省略关键逻辑，确保每个修改文件代码完整闭环。默认使用中文回答。',
 };
 
 export const MODE_SUGGESTIONS: Record<'chat' | 'code' | 'repo', string[]> = {

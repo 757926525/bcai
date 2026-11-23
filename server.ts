@@ -650,14 +650,31 @@ async function createServer() {
   });
 
   app.post('/api/auth/login-gate', requireAdmin, (req, res) => {
-    const { enabled } = req.body as { enabled?: boolean };
+    const { enabled, initialPassword } = req.body as { enabled?: boolean; initialPassword?: string };
     const store = getAdminStore();
-    store.requireLoginGate = Boolean(enabled);
+    const nextEnabled = Boolean(enabled);
+
+    if (nextEnabled && !hasAnyAdminPassword().hasPassword) {
+      const initPw = (initialPassword || '').trim();
+      if (initPw.length >= 4) {
+        const salt = crypto.randomBytes(16).toString('hex');
+        store.salt = salt;
+        store.passwordHash = hashPassword(initPw, salt);
+      } else {
+        res.status(400).json({
+          error: '开启全站登录拦截前，请先设定管理员密码（至少 4 位字符），避免锁站后无法验证身份。',
+        });
+        return;
+      }
+    }
+
+    store.requireLoginGate = nextEnabled;
     store.updatedAt = new Date().toISOString();
     writeJsonFile(ADMIN_AUTH_FILE, store);
     res.json({
       ok: true,
       requireLoginGate: store.requireLoginGate,
+      hasAdminPassword: hasAnyAdminPassword().hasPassword,
       message: store.requireLoginGate
         ? '已开启全站访问限制：未登录管理员将看到登录拦截界面'
         : '已关闭全站访问限制：普通访客可直接进入编程、绘图与对话区',
@@ -702,15 +719,25 @@ async function createServer() {
     });
   });
 
-  // Enforce global login gate on AI execution routes when toggled ON
-  app.use(['/api/chat', '/api/image', '/api/providers/probe'], (req, res, next) => {
-    const store = getAdminStore();
-    if (store.requireLoginGate && !isRequestAdmin(req)) {
-      res.status(401).json({ error: '工作台已开启管理员登录拦截开关，请先登录管理员后使用。' });
-      return;
+  // Enforce global login gate on AI execution and deploy package routes when toggled ON
+  app.use(
+    [
+      '/api/chat',
+      '/api/image',
+      '/api/providers/probe',
+      '/api/deploy/source-package.zip',
+      '/api/deploy/pages-package.zip',
+      '/api/deploy/repo-file',
+    ],
+    (req, res, next) => {
+      const store = getAdminStore();
+      if (store.requireLoginGate && !isRequestAdmin(req)) {
+        res.status(401).json({ error: '工作台已开启管理员登录拦截开关，请先登录管理员后使用。' });
+        return;
+      }
+      next();
     }
-    next();
-  });
+  );
 
   // Real live connectivity probe for providers (never fakes green!)
   app.post('/api/providers/probe', async (req, res) => {
@@ -945,7 +972,9 @@ async function createServer() {
 
         const buildGeminiConfig = (targetModel: string) => {
           const isG4 = targetModel.startsWith('gemini-4');
-          const cfg: Record<string, unknown> = {};
+          const cfg: Record<string, unknown> = {
+            maxOutputTokens: 32768,
+          };
           if (systemMsg) cfg.systemInstruction = systemMsg;
           if (targetModel === 'gemini-4-hydrogen') {
             cfg.thinkingConfig = { thinkingLevel: ThinkingLevel.MEDIUM };
@@ -1010,7 +1039,13 @@ async function createServer() {
             const chunk = step.value;
             const candidateFinish = chunk?.candidates?.[0]?.finishReason;
             if (candidateFinish) finishReason = String(candidateFinish);
-            const text = chunk?.text || '';
+            const parts = chunk?.candidates?.[0]?.content?.parts;
+            const text = Array.isArray(parts) && parts.length > 0
+              ? parts
+                  .filter((p: any) => !p?.thought)
+                  .map((p: any) => (typeof p?.text === 'string' ? p.text : ''))
+                  .join('')
+              : chunk?.text || '';
             if (text) {
               if (!receivedText) {
                 writeSse({ meta: { phase: 'writing', model: targetModel } });
@@ -1079,15 +1114,29 @@ async function createServer() {
 
         const formattedMsgs = buildOpenAIMessages(messages);
         const cfUrl = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(acc)}/ai/run/${model}`;
-        const upstream = await fetch(cfUrl, {
-          method: 'POST',
-          signal: ac.signal,
-          headers: {
-            authorization: `Bearer ${tok}`,
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({ messages: formattedMsgs, temperature, stream: true }),
-        });
+        const callWorkersAi = (maxTokens?: number) =>
+          fetch(cfUrl, {
+            method: 'POST',
+            signal: ac.signal,
+            headers: {
+              authorization: `Bearer ${tok}`,
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify({
+              messages: formattedMsgs,
+              temperature,
+              stream: true,
+              ...(maxTokens ? { max_tokens: maxTokens } : {}),
+            }),
+          });
+
+        let upstream = await callWorkersAi(8192);
+        if (upstream.status === 400) {
+          upstream = await callWorkersAi(4096);
+          if (upstream.status === 400) {
+            upstream = await callWorkersAi(undefined);
+          }
+        }
 
         if (!upstream.ok || !upstream.body) {
           const errText = await upstream.text();
@@ -1155,15 +1204,30 @@ async function createServer() {
       const formattedMsgs = buildOpenAIMessages(messages);
       const cleanBase = targetBase.replace(/\/+$/, '');
       const chatUrl = cleanBase.endsWith('/chat/completions') ? cleanBase : `${cleanBase}/chat/completions`;
-      const upstream = await fetch(chatUrl, {
-        method: 'POST',
-        signal: ac.signal,
-        headers: {
-          authorization: `Bearer ${token}`,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ model, messages: formattedMsgs, temperature, stream: true }),
-      });
+      const callOpenAiCompat = (maxTokens?: number) =>
+        fetch(chatUrl, {
+          method: 'POST',
+          signal: ac.signal,
+          headers: {
+            authorization: `Bearer ${token}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            model,
+            messages: formattedMsgs,
+            temperature,
+            stream: true,
+            ...(maxTokens ? { max_tokens: maxTokens } : {}),
+          }),
+        });
+
+      let upstream = await callOpenAiCompat(8192);
+      if (upstream.status === 400) {
+        upstream = await callOpenAiCompat(4096);
+        if (upstream.status === 400) {
+          upstream = await callOpenAiCompat(undefined);
+        }
+      }
 
       if (!upstream.ok || !upstream.body) {
         const errText = await upstream.text();
@@ -1216,17 +1280,21 @@ async function createServer() {
     }
   });
 
-  // Image Generation Endpoint (Workers AI + Negative Prompt + CFG Guidance + Seed + optional Gemini translation)
+  // Multi-Engine Image Generation Endpoint (Pollinations Zero-Key / Workers AI / SiliconFlow Kolors / HuggingFace / OpenAI-Compatible)
   app.post('/api/image', async (req, res) => {
     const {
       prompt,
       negativePrompt = '',
-      model = '@cf/black-forest-labs/flux-1-schnell',
+      model = 'pollinations:flux',
+      providerType: rawProviderType,
+      baseUrl = '',
       steps = 4,
       guidance = 7.5,
       seed,
       width = 1024,
       height = 1024,
+      enhanceMode: rawEnhanceMode,
+      stylePreset = 'none',
       translate = true,
       accountId,
       apiKey,
@@ -1234,48 +1302,112 @@ async function createServer() {
       prompt: string;
       negativePrompt?: string;
       model?: string;
+      providerType?: 'pollinations' | 'workers-ai' | 'siliconflow' | 'huggingface' | 'openai-image';
+      baseUrl?: string;
       steps?: number;
       guidance?: number;
       seed?: string | number;
       width?: number;
       height?: number;
+      enhanceMode?: 'none' | 'translate' | 'enhance';
+      stylePreset?: string;
       translate?: boolean;
       accountId?: string;
       apiKey?: string;
     };
 
-    if (!prompt) {
+    if (!prompt || !prompt.trim()) {
       res.status(400).json({ error: '请输入画面描述词' });
       return;
     }
 
-    let finalPrompt = prompt;
+    const STYLE_SUFFIXES: Record<string, { pos: string; neg: string }> = {
+      photorealistic: {
+        pos: 'photorealistic, 8k uhd, natural lighting, cinematic depth of field, sharp focus, shot on 35mm lens',
+        neg: 'cartoon, anime, 3d render, painting, artificial skin, blurry, overexposed',
+      },
+      anime: {
+        pos: 'high quality anime illustration, crisp cel shading, vibrant lighting, expressive details, clean lineart',
+        neg: 'photorealistic, 3d, deformed hands, extra fingers, muddy colors, lowres',
+      },
+      '3d-render': {
+        pos: 'octane render, 3d studio lighting, smooth subsurface scattering, volumetric light, clean geometric detail',
+        neg: 'flat 2d sketch, noise, grainy, blurry, distorted geometry',
+      },
+      'chinese-ink': {
+        pos: 'traditional Chinese ink wash and mineral color painting, poetic atmosphere, delicate brushwork, rice paper texture',
+        neg: 'modern neon, 3d plastic, harsh digital noise, cluttered',
+      },
+      cyberpunk: {
+        pos: 'cyberpunk sci-fi atmosphere, glowing neon reflections on wet surfaces, dramatic rim light, high contrast',
+        neg: 'daylight flat lighting, washed out, low contrast, blurry',
+      },
+      'ui-design': {
+        pos: 'clean modern studio product photography, minimal composition, soft diffused studio light, high-end industrial design',
+        neg: 'cluttered background, messy text, watermark, distorted typography',
+      },
+      'flat-illustration': {
+        pos: 'modern editorial vector illustration, balanced geometric shapes, harmonious color palette, crisp edges',
+        neg: 'photorealistic noise, 3d shading, muddy gradients, messy lines',
+      },
+    };
+
+    const providerType =
+      rawProviderType ||
+      (model.startsWith('pollinations:') ? 'pollinations' : model.startsWith('@cf/') ? 'workers-ai' : 'pollinations');
+    const enhanceMode: 'none' | 'translate' | 'enhance' =
+      rawEnhanceMode || (translate ? 'translate' : 'none');
+
+    const w = Math.min(Math.max(Number(width) || 1024, 256), 1536);
+    const h = Math.min(Math.max(Number(height) || 1024, 256), 1536);
+    const seedNum =
+      seed !== undefined && String(seed).trim() !== '' && !Number.isNaN(Number(seed))
+        ? Number(seed)
+        : undefined;
+
+    let finalPrompt = prompt.trim();
     let finalNegative = (negativePrompt || '').trim();
-    const acc = accountId || process.env.CF_ACCOUNT_ID || '';
-    const tok = apiKey || process.env.CF_API_TOKEN || '';
 
     try {
-      if (translate) {
+      // High-accuracy prompt refinement / translation via Gemini 3.1 Flash Lite (free tier)
+      if (enhanceMode !== 'none') {
         const ai = getGeminiClient();
         if (ai) {
-          if (/[\u4e00-\u9fff]/.test(finalPrompt)) {
+          if (enhanceMode === 'enhance') {
             try {
               const tr = await ai.models.generateContent({
                 model: 'gemini-3.1-flash-lite',
-                contents: `Translate this image generation prompt into concise, vivid English for FLUX/SDXL. Output ONLY the English prompt:\n${finalPrompt}`,
+                contents: `You are an expert visual prompt engineer for FLUX/SDXL/Kolors.
+Translate the following user prompt into precise, natural English (or refine it if already English).
+CRITICAL RULES:
+- Strictly preserve EVERY subject, count, spatial relation, color, action, and any exact quoted text requested by the user.
+- Add only fitting lighting, atmosphere, camera/composition, and texture details without altering the user's meaning.
+- Output ONLY a single concise paragraph (<= 95 words), no explanations or markdown quotes.
+User prompt: ${finalPrompt}`,
               });
-              if (tr.text) finalPrompt = tr.text.trim();
+              if (tr.text?.trim()) finalPrompt = tr.text.trim().replace(/^["']|["']$/g, '');
+            } catch {
+              // fallback to raw prompt
+            }
+          } else if (/[\u4e00-\u9fff]/.test(finalPrompt)) {
+            try {
+              const tr = await ai.models.generateContent({
+                model: 'gemini-3.1-flash-lite',
+                contents: `Translate this image generation prompt accurately into concise, vivid English for FLUX/SDXL, preserving all subjects, counts, colors, and details. Output ONLY the English prompt:\n${finalPrompt}`,
+              });
+              if (tr.text?.trim()) finalPrompt = tr.text.trim().replace(/^["']|["']$/g, '');
             } catch {
               // fallback
             }
           }
+
           if (finalNegative && /[\u4e00-\u9fff]/.test(finalNegative)) {
             try {
               const trNeg = await ai.models.generateContent({
                 model: 'gemini-3.1-flash-lite',
-                contents: `Translate this image generation negative prompt (things to avoid) into concise comma-separated English tags. Output ONLY the English tags:\n${finalNegative}`,
+                contents: `Translate this image generation negative prompt into concise comma-separated English tags. Output ONLY the English tags:\n${finalNegative}`,
               });
-              if (trNeg.text) finalNegative = trNeg.text.trim();
+              if (trNeg.text?.trim()) finalNegative = trNeg.text.trim();
             } catch {
               // fallback
             }
@@ -1283,22 +1415,198 @@ async function createServer() {
         }
       }
 
+      const preset = STYLE_SUFFIXES[stylePreset];
+      if (preset) {
+        finalPrompt = `${finalPrompt}, ${preset.pos}`;
+        finalNegative = finalNegative ? `${finalNegative}, ${preset.neg}` : preset.neg;
+      }
+
+      const sendImageBinary = (buf: Buffer | ArrayBuffer, contentType = 'image/png') => {
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('x-final-prompt', encodeURIComponent(finalPrompt));
+        if (finalNegative) {
+          res.setHeader('x-final-negative', encodeURIComponent(finalNegative));
+        }
+        res.send(Buffer.isBuffer(buf) ? buf : Buffer.from(buf));
+      };
+
+      // 1. Built-in Zero-Key Pollinations FLUX / Turbo Engine
+      if (providerType === 'pollinations') {
+        const pollModel = model.replace(/^pollinations:/, '') || 'flux';
+        const qs = new URLSearchParams({
+          model: pollModel,
+          width: String(w),
+          height: String(h),
+          nologo: 'true',
+          enhance: String(enhanceMode === 'enhance'),
+        });
+        if (seedNum !== undefined) qs.set('seed', String(seedNum));
+        if (finalNegative) qs.set('negative_prompt', finalNegative);
+
+        const pollUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(finalPrompt)}?${qs.toString()}`;
+        let upstream = await fetch(pollUrl);
+        if (upstream.status >= 500 || upstream.status === 429) {
+          await new Promise((r) => setTimeout(r, 900));
+          upstream = await fetch(pollUrl);
+        }
+        if (!upstream.ok) {
+          const txt = await upstream.text().catch(() => '');
+          res.status(upstream.status).json({ error: `Pollinations 绘图服务返回 HTTP ${upstream.status}: ${txt.slice(0, 160)}` });
+          return;
+        }
+        const ctype = upstream.headers.get('content-type') || 'image/jpeg';
+        sendImageBinary(await upstream.arrayBuffer(), ctype);
+        return;
+      }
+
+      // 2. SiliconFlow Kolors (Free Chinese/English Image Generation)
+      if (providerType === 'siliconflow') {
+        const token = (apiKey || '').trim();
+        if (!token) {
+          res.status(400).json({ error: '请在外接绘图配置中填写 SiliconFlow API Key' });
+          return;
+        }
+        const target = (baseUrl || 'https://api.siliconflow.cn/v1/images/generations').trim();
+        assertSafeExternalUrl(target);
+        const upstream = await fetch(target, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: model || 'Kwai-Kolors/Kolors',
+            prompt: finalPrompt,
+            ...(finalNegative ? { negative_prompt: finalNegative } : {}),
+            image_size: `${w}x${h}`,
+            num_inference_steps: Math.min(Math.max(Number(steps) || 20, 1), 50),
+            guidance_scale: Number(guidance) || 7.5,
+            ...(seedNum !== undefined ? { seed: seedNum } : {}),
+          }),
+        });
+        if (!upstream.ok) {
+          res.status(upstream.status).json({ error: (await upstream.text()).slice(0, 260) || 'SiliconFlow 绘图失败' });
+          return;
+        }
+        const j = (await upstream.json()) as {
+          images?: Array<{ url?: string }>;
+          data?: Array<{ url?: string; b64_json?: string }>;
+        };
+        const imgB64 = j?.data?.[0]?.b64_json;
+        if (imgB64) {
+          sendImageBinary(Buffer.from(imgB64, 'base64'), 'image/png');
+          return;
+        }
+        const imgUrl = j?.images?.[0]?.url || j?.data?.[0]?.url;
+        if (!imgUrl) {
+          res.status(500).json({ error: 'SiliconFlow 未返回图像 URL' });
+          return;
+        }
+        assertSafeExternalUrl(imgUrl);
+        const imgRes = await fetch(imgUrl);
+        if (!imgRes.ok) {
+          res.status(502).json({ error: `下载生成结果失败 HTTP ${imgRes.status}` });
+          return;
+        }
+        sendImageBinary(await imgRes.arrayBuffer(), imgRes.headers.get('content-type') || 'image/png');
+        return;
+      }
+
+      // 3. Hugging Face Inference API
+      if (providerType === 'huggingface') {
+        const token = (apiKey || '').trim();
+        if (!token) {
+          res.status(400).json({ error: '请在外接绘图配置中填写 Hugging Face Access Token' });
+          return;
+        }
+        const cleanBase = (baseUrl || 'https://router.huggingface.co/hf-inference/models').trim().replace(/\/+$/, '');
+        const cleanModel = model.replace(/^\/+/, '');
+        const target = cleanBase.endsWith(cleanModel) ? cleanBase : `${cleanBase}/${cleanModel}`;
+        assertSafeExternalUrl(target);
+        const upstream = await fetch(target, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+          body: JSON.stringify({
+            inputs: finalPrompt,
+            parameters: {
+              ...(finalNegative ? { negative_prompt: finalNegative } : {}),
+              width: w,
+              height: h,
+              num_inference_steps: Math.min(Math.max(Number(steps) || 25, 1), 50),
+              guidance_scale: Number(guidance) || 7.5,
+              ...(seedNum !== undefined ? { seed: seedNum } : {}),
+            },
+          }),
+        });
+        if (!upstream.ok) {
+          res.status(upstream.status).json({ error: (await upstream.text()).slice(0, 260) || 'Hugging Face 绘图失败' });
+          return;
+        }
+        sendImageBinary(await upstream.arrayBuffer(), upstream.headers.get('content-type') || 'image/png');
+        return;
+      }
+
+      // 4. Generic OpenAI /v1/images/generations Compatible API (Together / Fireworks / OneAPI / etc.)
+      if (providerType === 'openai-image') {
+        const token = (apiKey || '').trim();
+        if (!token) {
+          res.status(400).json({ error: '请在外接绘图配置中填写兼容接口 API Key' });
+          return;
+        }
+        const cleanBase = (baseUrl || 'https://api.together.xyz/v1/images/generations').trim().replace(/\/+$/, '');
+        const target = cleanBase.endsWith('/images/generations') ? cleanBase : `${cleanBase}/images/generations`;
+        assertSafeExternalUrl(target);
+        const upstream = await fetch(target, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model,
+            prompt: finalPrompt,
+            size: `${w}x${h}`,
+            n: 1,
+          }),
+        });
+        if (!upstream.ok) {
+          res.status(upstream.status).json({ error: (await upstream.text()).slice(0, 260) || '外接绘图接口调用失败' });
+          return;
+        }
+        const j = (await upstream.json()) as { data?: Array<{ url?: string; b64_json?: string }> };
+        const b64 = j?.data?.[0]?.b64_json;
+        if (b64) {
+          sendImageBinary(Buffer.from(b64, 'base64'), 'image/png');
+          return;
+        }
+        const imgUrl = j?.data?.[0]?.url;
+        if (!imgUrl) {
+          res.status(500).json({ error: '外接绘图接口未返回图像数据' });
+          return;
+        }
+        assertSafeExternalUrl(imgUrl);
+        const imgRes = await fetch(imgUrl);
+        if (!imgRes.ok) {
+          res.status(502).json({ error: `下载生成结果失败 HTTP ${imgRes.status}` });
+          return;
+        }
+        sendImageBinary(await imgRes.arrayBuffer(), imgRes.headers.get('content-type') || 'image/png');
+        return;
+      }
+
+      // 5. Cloudflare Workers AI Image Models
+      const acc = accountId || process.env.CF_ACCOUNT_ID || '';
+      const tok = apiKey || process.env.CF_API_TOKEN || '';
       if (!acc || !tok) {
         res.status(400).json({
-          error: '未配置 Cloudflare Workers AI 凭证（CF_ACCOUNT_ID / CF_API_TOKEN），请在设置区绑定或在 Cloudflare Pages 环境下使用内置 env.AI 免费绘图。',
+          error: 'Workers AI 需配置 CF_ACCOUNT_ID / CF_API_TOKEN（或先切换至顶部免 Key 的 Pollinations FLUX 免费绘图引擎）。',
         });
         return;
       }
 
       const input: Record<string, unknown> = { prompt: finalPrompt, num_steps: steps };
-      if (!model.includes('flux')) {
-        input.width = width;
-        input.height = height;
+      if (!model.includes('flux-1-schnell')) {
+        input.width = w;
+        input.height = h;
         if (finalNegative) input.negative_prompt = finalNegative;
         if (typeof guidance === 'number' && !Number.isNaN(guidance)) input.guidance = guidance;
       }
-      if (seed !== undefined && String(seed).trim() !== '' && !Number.isNaN(Number(seed))) {
-        input.seed = Number(seed);
+      if (seedNum !== undefined) {
+        input.seed = seedNum;
       }
 
       const cfUrl = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(acc)}/ai/run/${model}`;
@@ -1325,17 +1633,11 @@ async function createServer() {
           res.status(500).json({ error: '未返回有效图像数据' });
           return;
         }
-        const buf = Buffer.from(b64, 'base64');
-        res.setHeader('Content-Type', 'image/png');
-        res.setHeader('x-final-prompt', encodeURIComponent(finalPrompt));
-        res.send(buf);
+        sendImageBinary(Buffer.from(b64, 'base64'), 'image/png');
         return;
       }
 
-      const arrayBuf = await upstream.arrayBuffer();
-      res.setHeader('Content-Type', ctype);
-      res.setHeader('x-final-prompt', encodeURIComponent(finalPrompt));
-      res.send(Buffer.from(arrayBuf));
+      sendImageBinary(await upstream.arrayBuffer(), ctype);
     } catch (err: any) {
       res.status(500).json({ error: err?.message || '图像生成失败' });
     }

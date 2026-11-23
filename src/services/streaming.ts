@@ -250,6 +250,7 @@ export async function streamChatCompletion(params: {
     let finishReason: string | undefined;
     let activeModel = modelId;
     let receivedContent = false;
+    let inReasoningBlock = false;
 
     const processLine = (line: string) => {
       const trimmed = line.trim();
@@ -257,6 +258,10 @@ export async function streamChatCompletion(params: {
       const payload = trimmed.slice(5).trim();
       if (!payload) return;
       if (payload === '[DONE]') {
+        if (inReasoningBlock) {
+          inReasoningBlock = false;
+          callbacks.onChunk('\n</think>\n\n');
+        }
         receivedDone = true;
         return;
       }
@@ -285,9 +290,10 @@ export async function streamChatCompletion(params: {
       const choiceFinish = json?.choices?.[0]?.finish_reason;
       if (choiceFinish) {
         finishReason = String(choiceFinish);
-        if (choiceFinish === 'length') {
+        const lowFinish = finishReason.toLowerCase();
+        if (lowFinish === 'length' || lowFinish === 'max_tokens') {
           truncated = true;
-          callbacks.onMeta?.({ phase: 'truncated', finishReason: 'length', truncated: true, model: activeModel });
+          callbacks.onMeta?.({ phase: 'truncated', finishReason, truncated: true, model: activeModel });
         }
       }
 
@@ -297,9 +303,17 @@ export async function streamChatCompletion(params: {
         piece = json.response;
       } else if (deltaObj) {
         if (typeof deltaObj.reasoning_content === 'string' && deltaObj.reasoning_content) {
-          piece = deltaObj.reasoning_content;
+          if (!inReasoningBlock) {
+            inReasoningBlock = true;
+            piece += '<think>\n';
+          }
+          piece += deltaObj.reasoning_content;
         }
         if (typeof deltaObj.content === 'string' && deltaObj.content) {
+          if (inReasoningBlock) {
+            inReasoningBlock = false;
+            piece += '\n</think>\n\n';
+          }
           piece += deltaObj.content;
         }
       }
@@ -324,6 +338,10 @@ export async function streamChatCompletion(params: {
     }
     if (buffer.trim()) {
       processLine(buffer);
+    }
+    if (inReasoningBlock) {
+      inReasoningBlock = false;
+      callbacks.onChunk('\n</think>\n\n');
     }
 
     const interrupted = !receivedDone && !signal.aborted && receivedContent;

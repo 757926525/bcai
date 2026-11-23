@@ -9,6 +9,9 @@ interface AuthPlanModalProps {
   selectedPlan: 'free' | 'cloudflare' | 'pro-api';
   onSelectPlan: (plan: 'free' | 'cloudflare' | 'pro-api') => void;
   isAdmin: boolean;
+  requireLoginGate?: boolean;
+  onToggleLoginGate?: (enabled: boolean, initialPassword?: string) => Promise<void>;
+  onLockGateNow?: () => Promise<void> | void;
   onAdminLoggedIn: (token: string, hasPw: boolean) => void;
   onAdminLoggedOut: () => void;
   onPasswordUpdated: (msg: string) => void;
@@ -57,12 +60,17 @@ export const AuthPlanModal: React.FC<AuthPlanModalProps> = ({
   selectedPlan,
   onSelectPlan,
   isAdmin,
+  requireLoginGate = false,
+  onToggleLoginGate,
+  onLockGateNow,
   onAdminLoggedIn,
   onAdminLoggedOut,
   onPasswordUpdated,
 }) => {
   const [pwInput, setPwInput] = useState('');
   const [newAdminPw, setNewAdminPw] = useState('');
+  const [gateInitPw, setGateInitPw] = useState('');
+  const [togglingGate, setTogglingGate] = useState(false);
   const [loading, setLoading] = useState(false);
   const [savingPw, setSavingPw] = useState(false);
   const [err, setErr] = useState('');
@@ -240,6 +248,76 @@ export const AuthPlanModal: React.FC<AuthPlanModalProps> = ({
                 {msg && <p className="text-xs text-emerald-700 dark:text-emerald-400">{msg}</p>}
                 {err && <p className="text-xs text-red-600 dark:text-red-400">{err}</p>}
               </form>
+
+              {onToggleLoginGate && (
+                <div className="pt-3 border-t border-emerald-200/70 dark:border-emerald-900/60 space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-xs wb-ink space-y-0.5">
+                      <div className="font-semibold flex items-center gap-1.5">
+                        <Lock className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                        <span>全站访问限制开关（管理员登录门禁）</span>
+                      </div>
+                      <div className="wb-muted">
+                        {requireLoginGate ? '已开启：未登录访客将被全屏登录页拦截' : '已关闭：访客免登录即可使用编程与绘图'}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {requireLoginGate && onLockGateNow && (
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            await onLockGateNow();
+                            onClose();
+                          }}
+                          className="h-8 px-2.5 rounded-lg border border-amber-400/60 bg-amber-500/15 text-xs font-medium text-amber-800 dark:text-amber-300"
+                        >
+                          立即锁屏
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        disabled={togglingGate}
+                        onClick={async () => {
+                          setErr('');
+                          setMsg('');
+                          if (!requireLoginGate && !publicConfig?.hasAdminPassword && gateInitPw.trim().length < 4) {
+                            setErr('请先设置至少 4 位管理员密码后再开启全站访问限制');
+                            return;
+                          }
+                          setTogglingGate(true);
+                          try {
+                            await onToggleLoginGate(
+                              !requireLoginGate,
+                              !requireLoginGate && gateInitPw.trim() ? gateInitPw.trim() : undefined
+                            );
+                            setGateInitPw('');
+                          } catch (error: any) {
+                            setErr(error?.message || '切换门禁失败');
+                          } finally {
+                            setTogglingGate(false);
+                          }
+                        }}
+                        className={`h-8 px-3 rounded-lg border text-xs font-medium ${
+                          requireLoginGate
+                            ? 'bg-blue-600 border-blue-600 text-white'
+                            : 'wb-panel wb-border wb-ink'
+                        } disabled:opacity-50`}
+                      >
+                        {togglingGate ? '切换中...' : requireLoginGate ? '已开启 · 点击关闭' : '点击开启全站拦截'}
+                      </button>
+                    </div>
+                  </div>
+                  {!requireLoginGate && !publicConfig?.hasAdminPassword && (
+                    <input
+                      type="password"
+                      value={gateInitPw}
+                      onChange={(e) => setGateInitPw(e.target.value)}
+                      placeholder="首次开启门禁：输入至少 4 位管理员密码"
+                      className="w-full h-9 px-3 rounded-lg border wb-border wb-panel text-xs wb-ink focus:outline-none"
+                    />
+                  )}
+                </div>
+              )}
             </div>
           )}
 

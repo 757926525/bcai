@@ -5,10 +5,76 @@ import { LANG_EXT_MAP, parseMarkdownSegments } from '../utils/codeBlocks';
 interface MarkdownRendererProps {
   content: string;
   isStreamingMessage?: boolean;
+  siblingBlocks?: Array<{ lang: string; filename?: string; code: string }>;
   onSaveCodeToDb?: (code: string, lang: string, filename?: string) => void;
   onSendCodeToRepo?: (code: string, lang: string, filename?: string) => void;
   onSaveCodeToConnector?: (code: string, lang: string, filename?: string) => void;
   repoConnected?: boolean;
+}
+
+function assembleHtmlPreviewDoc(
+  htmlCode: string,
+  siblingBlocks?: Array<{ lang: string; filename?: string; code: string }>
+): string {
+  if (!siblingBlocks || siblingBlocks.length === 0) return htmlCode;
+  let doc = htmlCode;
+
+  const cssBlocks = siblingBlocks.filter(
+    (b) => b.lang.toLowerCase() === 'css' || Boolean(b.filename?.toLowerCase().endsWith('.css'))
+  );
+  const jsBlocks = siblingBlocks.filter((b) => {
+    const l = b.lang.toLowerCase();
+    return (
+      l === 'javascript' ||
+      l === 'js' ||
+      Boolean(b.filename && /\.(?:js|mjs)$/i.test(b.filename))
+    );
+  });
+
+  const usedCss = new Set<number>();
+  const usedJs = new Set<number>();
+
+  // Replace matching <link rel="stylesheet" href="..."> with inline <style>
+  doc = doc.replace(/<link\b[^>]*href=["']([^"']+)["'][^>]*>/gi, (full, href: string) => {
+    if (/^https?:\/\//i.test(href)) return full;
+    const base = href.split('/').pop()?.split('?')[0]?.toLowerCase() || '';
+    const idx = cssBlocks.findIndex((b, i) => {
+      if (usedCss.has(i)) return false;
+      const fn = (b.filename || '').toLowerCase();
+      return fn === href.toLowerCase() || (base && fn.endsWith(base));
+    });
+    if (idx >= 0) {
+      usedCss.add(idx);
+      return `<style>\n${cssBlocks[idx].code}\n</style>`;
+    }
+    return full;
+  });
+
+  // Replace matching <script src="..."></script> with inline <script>
+  doc = doc.replace(/<script\b[^>]*src=["']([^"']+)["'][^>]*>\s*<\/script>/gi, (full, src: string) => {
+    if (/^https?:\/\//i.test(src)) return full;
+    const base = src.split('/').pop()?.split('?')[0]?.toLowerCase() || '';
+    const idx = jsBlocks.findIndex((b, i) => {
+      if (usedJs.has(i)) return false;
+      const fn = (b.filename || '').toLowerCase();
+      return fn === src.toLowerCase() || (base && fn.endsWith(base));
+    });
+    if (idx >= 0) {
+      usedJs.add(idx);
+      return `<script>\n${jsBlocks[idx].code}\n</script>`;
+    }
+    return full;
+  });
+
+  // Fallback: if HTML mentions no inline <style> and there is a single CSS sibling block (like styles.css), append before </head>
+  const remainingCss = cssBlocks.filter((_, i) => !usedCss.has(i));
+  if (remainingCss.length > 0 && !/<link\b[^>]*href=["'](?!https?:\/\/)/i.test(doc)) {
+    const extraStyles = remainingCss.map((b) => `<style>\n${b.code}\n</style>`).join('\n');
+    if (/<\/head>/i.test(doc)) doc = doc.replace(/<\/head>/i, `${extraStyles}\n</head>`);
+    else doc = `${extraStyles}\n${doc}`;
+  }
+
+  return doc;
 }
 
 function renderInline(line: string): React.ReactNode[] {
@@ -218,6 +284,7 @@ const CodeBlock: React.FC<{
 export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
   content,
   isStreamingMessage,
+  siblingBlocks,
   onSaveCodeToDb,
   onSendCodeToRepo,
   onSaveCodeToConnector,
@@ -272,7 +339,12 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
                 onSaveCodeToDb={onSaveCodeToDb}
                 onSendCodeToRepo={onSendCodeToRepo}
                 onSaveCodeToConnector={onSaveCodeToConnector}
-                onPreviewHtml={(c, t) => setPreviewHtml({ code: c, title: t || 'HTML 实时预览' })}
+                onPreviewHtml={(c, t) =>
+                  setPreviewHtml({
+                    code: assembleHtmlPreviewDoc(c, siblingBlocks),
+                    title: t || 'HTML 实时预览',
+                  })
+                }
                 repoConnected={repoConnected}
               />
             );

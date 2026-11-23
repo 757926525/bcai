@@ -58,14 +58,35 @@ export interface ModelOption {
   note?: string;
 }
 
+export type ImageProviderType =
+  | 'pollinations'
+  | 'workers-ai'
+  | 'siliconflow'
+  | 'huggingface'
+  | 'openai-image';
+
 export interface ImageModelOption {
   id: string;
   name: string;
+  providerType: ImageProviderType;
   defaultSteps: number;
   maxSteps: number;
   supportsCustomSize: boolean;
   supportsNegativePrompt: boolean;
+  supportsGuidance: boolean;
+  requiresKey?: boolean;
   quotaSummary: string;
+}
+
+export interface ExternalImageProvider {
+  id: string;
+  name: string;
+  providerType: 'siliconflow' | 'huggingface' | 'openai-image' | 'workers-ai';
+  baseUrl: string;
+  apiKey: string;
+  accountId?: string;
+  modelId: string;
+  enabled: boolean;
 }
 
 export interface ChatAttachment {
@@ -89,6 +110,8 @@ export interface ChatMessage {
   truncated?: boolean;
   interrupted?: boolean;
   finishReason?: string;
+  autoContinuedRounds?: number;
+  completedCleanly?: boolean;
 }
 
 export interface Conversation {
@@ -113,6 +136,9 @@ export interface GeneratedImageCard {
   negativePrompt?: string;
   finalPrompt: string;
   modelId: string;
+  providerType?: ImageProviderType;
+  stylePreset?: string;
+  size?: string;
   guidance?: number;
   seed?: string;
   url: string;

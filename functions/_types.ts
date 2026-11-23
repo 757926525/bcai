@@ -37,6 +37,7 @@ export interface CFEnv {
   };
   BUCKET?: R2Bucket;
   ACCESS_PASSWORD?: string;
+  REQUIRE_LOGIN_GATE?: string;
   GEMINI_API_KEY?: string;
   CF_ACCOUNT_ID?: string;
   CF_API_TOKEN?: string;

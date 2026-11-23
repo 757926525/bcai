@@ -29,6 +29,7 @@ import {
   ProviderStatusInfo,
 } from '../types';
 import {
+  analyzeProjectCompleteness,
   extractCodeBlocks,
   hasUnclosedCodeFence,
   LANG_EXT_MAP,
@@ -48,6 +49,8 @@ interface ChatWorkspaceProps {
   activeStreamModel?: string;
   streamStartedAt?: number | null;
   autoContinue: boolean;
+  autoContinueRound?: number;
+  completenessDetail?: string;
   onToggleAutoContinue: () => void;
   isAdmin: boolean;
   isMobileLayout: boolean;
@@ -86,6 +89,8 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   activeStreamModel,
   streamStartedAt,
   autoContinue,
+  autoContinueRound,
+  completenessDetail,
   onToggleAutoContinue,
   isAdmin,
   isMobileLayout,
@@ -421,13 +426,21 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
 
   const lastMessage = conversation.messages[conversation.messages.length - 1];
   const lastIsAssistant = lastMessage?.role === 'assistant';
-  const lastHasUnclosed = lastIsAssistant && hasUnclosedCodeFence(lastMessage?.content || '');
+
+  const lastCompleteness = useMemo(() => {
+    if (!lastIsAssistant) return null;
+    return analyzeProjectCompleteness(lastMessage?.content || '', conversation.mode, {
+      truncated: lastMessage?.truncated,
+      interrupted: lastMessage?.interrupted,
+      finishReason: lastMessage?.finishReason,
+    });
+  }, [lastIsAssistant, lastMessage?.content, lastMessage?.truncated, lastMessage?.interrupted, lastMessage?.finishReason, conversation.mode]);
 
   const canContinuePartial =
     !isStreaming &&
     conversation.status === 'active' &&
     lastIsAssistant &&
-    Boolean(lastMessage?.paused || lastMessage?.truncated || lastMessage?.interrupted || lastHasUnclosed);
+    Boolean(lastMessage?.paused || lastCompleteness?.incomplete);
 
   // Live metrics for ProjectStatusLights
   const projectMetrics = useMemo(() => {
@@ -474,6 +487,8 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
         generatedChars={projectMetrics.generatedChars}
         hasUnclosedCode={projectMetrics.hasUnclosed}
         autoContinue={autoContinue}
+        autoContinueRound={autoContinueRound}
+        completenessDetail={completenessDetail || lastCompleteness?.detail}
         onToggleAutoContinue={onToggleAutoContinue}
         onExportProjectZip={handleDownloadConversationZip}
         canExportZip={projectMetrics.sessionBlockCount > 0}
@@ -559,6 +574,22 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                         <span className="text-red-600 dark:text-red-400 font-medium">流式意外中断，可续写</span>
                       </>
                     )}
+                    {typeof m.autoContinuedRounds === 'number' && m.autoContinuedRounds > 0 && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="text-cyan-700 dark:text-cyan-400 font-medium">
+                          已自动续写 {m.autoContinuedRounds} 轮
+                        </span>
+                      </>
+                    )}
+                    {m.completedCleanly && !isStreamingThis && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="text-emerald-700 dark:text-emerald-400 font-medium">
+                          ✅ 项目完整已停止
+                        </span>
+                      </>
+                    )}
                   </div>
 
                   {m.role === 'user' ? (
@@ -603,6 +634,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                       <MarkdownRenderer
                         content={m.content}
                         isStreamingMessage={isStreamingThis}
+                        siblingBlocks={blocks}
                         onSaveCodeToDb={isAdmin ? onSaveCodeToDb : undefined}
                         onSendCodeToRepo={isAdmin ? onSendCodeToRepo : undefined}
                         onSaveCodeToConnector={isAdmin && onSaveCodeToConnector ? openConnectorPicker : undefined}
@@ -836,13 +868,9 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
               <span className="inline-flex items-center gap-1.5 min-w-0">
                 <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse shrink-0" />
                 <span className="truncate">
-                  {lastMessage?.interrupted
-                    ? '检测到上次流式连接中断，已完整保留已生成内容。'
-                    : lastMessage?.truncated
-                    ? '长内容已达单轮输出上限，保留前文并可无缝续写。'
-                    : lastHasUnclosed
-                    ? '检测到代码块尚未闭合，可点击右侧无缝补全剩余代码。'
-                    : '上一条回复已暂停，保留已生成片段。'}
+                  {lastMessage?.paused
+                    ? '上一条回复已手动暂停，完整保留已生成片段，可继续续写。'
+                    : lastCompleteness?.detail || '检测到输出尚未完全收尾，已完整保留前文。'}
                 </span>
               </span>
               <button
@@ -850,7 +878,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                 onClick={onResumePartial}
                 className="font-semibold underline underline-offset-2 shrink-0 ml-2"
               >
-                断点续写
+                立即续写完成
               </button>
             </div>
           )}
